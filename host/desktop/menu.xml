@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Right-click menu of the noVNC screen (devbox). Installed by 20-user-setup.sh. -->
+<openbox_menu xmlns="http://openbox.org/3.4/menu">
+  <menu id="root-menu" label="devbox">
+    <item label="Chrome (your accounts)">
+      <action name="Execute"><execute>@HOME@/.local/bin/devbox-browser open</execute></action>
+    </item>
+    <separator />
+    <item label="Reload menu">
+      <action name="Reconfigure" />
+    </item>
+  </menu>
+</openbox_menu>

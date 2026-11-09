@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# devbox-novnc: serves the screen :1 in a browser (noVNC), on port 6080.
+# Listens on the host's Tailscale address (http://devbox:6080/vnc.html from your machines),
+# never on the public address. Without Tailscale, falls back to 127.0.0.1 (SSH tunnel).
+# Called by the systemd --user service devbox-novnc.
+set -euo pipefail
+
+ip=""
+if command -v tailscale >/dev/null 2>&1; then
+  # At boot, tailscaled may start after us: wait for it for up to 60 s.
+  for _ in $(seq 1 60); do
+    ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+    [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+$ ]] && break
+    ip=""
+    sleep 1
+  done
+fi
+listen="${ip:-127.0.0.1}"
+echo "noVNC listening on $listen:6080"
+exec /usr/bin/websockify --web /usr/share/novnc "$listen:6080" 127.0.0.1:5901

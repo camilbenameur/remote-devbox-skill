@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""devbox-relay: when the user's PC is off, take over Desktop sessions that got cut off.
+
+A Claude Desktop SSH session runs on the host, but it is Desktop that keeps renewing its
+connection to the Claude account. With the PC off, the session eventually stops (expired
+token) or stays stuck on a question. This service watches, and once Desktop has been gone for
+RELAY_ABSENCE_MIN minutes, it resumes each interrupted Desktop session:
+
+    claude --resume <id> --fork-session --bg --remote-control "relay · <name>"
+
+The copy has the whole conversation, runs in the background with the CLI's own login (which
+renews itself) and can be driven from claude.ai/code or the Claude app. A SessionStart hook
+(`devbox-relay guard`) tells the original session that it was relayed, if Desktop reopens it,
+so that the work is not done twice.
+
+Triggers (Desktop absent, session active at the time Desktop left):
+  auth     last entry is an authentication error (expired token), with no recovery for 5 min
+  dead     the session process vanished while a turn was in progress
+  waiting  Claude Code marks the session "waiting" (permission or question) for
+           RELAY_WAIT_MIN minutes, with no activity at all
+
+Usage:
+  devbox-relay loop      continuous watching (systemd service devbox-relay)
+  devbox-relay status    what the relay sees right now, without doing anything
+  devbox-relay once      a single watch pass (tests)
+  devbox-relay guard     SessionStart hook (reads the hook JSON on stdin)
+  devbox-relay test      detection tests, without Claude
+
+Variables: RELAY_ABSENCE_MIN=10  RELAY_WAIT_MIN=15  RELAY_INTERVAL_S=30
+           RELAY_DRY_RUN=1 (log without relaying)  RELAY_FORCE_ABSENT=1 (tests)
+           RELAY_TEST_SESSIONS=id1,id2 (treat these sessions as Desktop sessions)
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".local", "state", "devbox-relay")
+LOG_FILE = os.path.join(HOME, "dev", "_relay", "log.md")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+CLAUDE = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
+
+ABSENCE_MIN = float(os.environ.get("RELAY_ABSENCE_MIN", "10"))
+WAIT_MIN = float(os.environ.get("RELAY_WAIT_MIN", "15"))
+INTERVAL = float(os.environ.get("RELAY_INTERVAL_S", "30"))
+DRY = os.environ.get("RELAY_DRY_RUN") == "1"
+FORCE_ABSENT = os.environ.get("RELAY_FORCE_ABSENT") == "1"
+TEST_IDS = {s for s in os.environ.get("RELAY_TEST_SESSIONS", "").split(",") if s}
+MAX_AGE_H = 24          # a session idle for more than a day is not relayed
+MARGIN_S = 15 * 60      # the session must have been alive within 15 min before Desktop left
+MAX_ATTEMPTS = 3
+PREFIX = "relay · "
+
+AUTH_RE = re.compile(r"\b401\b|authenticat|oauth|token (has )?expired|/login|unauthori", re.I)
+ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+INTERRUPTED = "[Request interrupted"
+
+PROMPT = (
+    "[Automatic devbox relay] The user's PC is off or Desktop is closed: the Desktop session "
+    "whose conversation you are resuming was interrupted ({reason}) around {time}. You are "
+    "its continuation, running in the background on the host and drivable from claude.ai/code. "
+    "Pick up exactly where it stopped and finish the task in progress, under the same rules as "
+    "before. If a command was running, first check what it already did before running it "
+    "again. If the last action was waiting for a permission, decide cautiously; if it is a real "
+    "decision that belongs to the user (sending, publishing, spending, deleting), do not act: "
+    "write your question clearly and stop. If the task was already finished, do nothing more "
+    "and say so in one line."
+)
+REASONS = {
+    "auth": "account login expired",
+    "dead": "process stopped mid-work",
+    "waiting": "question or permission left unanswered",
+}
+
+
+# ----------------------------------------------------------------------------- utilities
+def now():
+    return time.time()
+
+
+def iso(t=None):
+    return datetime.datetime.fromtimestamp(t or now()).strftime("%Y-%m-%d %H:%M")
+
+
+def log(msg):
+    print(f"[{iso()}] {msg}", flush=True)
+
+
+def write_log_file(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        new = not os.path.exists(LOG_FILE)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            if new:
+                f.write("# devbox relay log\n\nDesktop sessions automatically resumed in the "
+                        "background (devbox-relay).\n\n")
+            f.write(f"- {iso()}: {msg}\n")
+    except OSError as e:
+        log(f"cannot write log file: {e!r}")
+
+
+def parse_ts(s):
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def all_pids():
+    return [int(p) for p in os.listdir("/proc") if p.isdigit()]
+
+
+def children_map():
+    m = {}
+    for pid in all_pids():
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        m.setdefault(ppid, []).append(pid)
+    return m
+
+
+def descendants(pid, cmap):
+    out, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        for c in cmap.get(p, []):
+            out.append(c)
+            todo.append(c)
+    return out
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+# ----------------------------------------------------------------------------- Desktop
+def desktop_present():
+    """Desktop connected <=> a "server --bridge" process of the Desktop helper exists. It lives
+    under Desktop's SSH connection; if the PC is cut off abruptly, sshd drops the connection
+    after ClientAliveInterval x ClientAliveCountMax (30 s x 6 on devbox), and the bridge
+    disappears."""
+    me = os.getpid()
+    for pid in all_pids():
+        if pid == me:
+            continue
+        c = cmdline(pid)
+        if "/.claude/remote/srv/" in c and "--bridge" in c:
+            return True
+    return False
+
+
+# ----------------------------------------------------------------------------- sessions
+def agents():
+    """Live sessions as seen by Claude Code. None = unknown: nothing is decided this pass
+    (a failing CLI must never make us believe that all sessions are dead)."""
+    try:
+        p = subprocess.run([CLAUDE, "agents", "--json"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = (p.stdout or "").strip()
+    if p.returncode != 0 or not out:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return {a["sessionId"]: a for a in data if isinstance(a, dict) and isinstance(a.get("sessionId"), str)}
+
+
+def transcript_path(sid):
+    hits = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl"))
+    return hits[0] if hits else None
+
+
+def head_entrypoint(path, lines=40):
+    """Entrypoint read from the first lines only (quick triage before the full analysis)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= lines:
+                    break
+                m = re.search(r'"entrypoint"\s*:\s*"([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def text_of(msg):
+    c = (msg or {}).get("content") if isinstance(msg, dict) else None
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+_CACHE = {}
+
+
+def analyze_file(path):
+    """Streaming analysis (whole file, in order, to pair each tool_use with its tool_result),
+    cached as long as the file does not change."""
+    try:
+        s = os.stat(path)
+    except OSError:
+        return None
+    key = (path, s.st_size, s.st_mtime)
+    if key in _CACHE:
+        return _CACHE[key]
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            st = analyze(_iter_json(f))
+    except OSError:
+        return None
+    for k in [k for k in _CACHE if k[0] == path]:
+        del _CACHE[k]
+    _CACHE[key] = st
+    return st
+
+
+def _iter_json(lines):
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            yield r
+
+
+def analyze(recs):
+    """State of the end of the conversation: entrypoint, model, cwd, name, last timestamp,
+    trailing auth error, pending tool (tool_use without tool_result), turn finished."""
+    st = {"entrypoint": None, "model": None, "cwd": None, "name": None, "last_ts": None,
+          "auth_error": False, "trailing_auth_ts": None, "pending_tool": False, "finished": True}
+    last_conv = None
+    open_tools = set()
+    for r in recs:
+        if r.get("entrypoint"):
+            st["entrypoint"] = st["entrypoint"] or r["entrypoint"]
+        if isinstance(r.get("cwd"), str):
+            st["cwd"] = r["cwd"]
+        typ = r.get("type")
+        if typ in ("custom-title", "agent-name"):
+            st["name"] = r.get("customTitle") or r.get("agentName") or st["name"]
+            continue
+        if typ == "system" and r.get("subtype") == "api_error":
+            if AUTH_RE.search(json.dumps(r.get("error") or "", ensure_ascii=False)):
+                st["trailing_auth_ts"] = parse_ts(r.get("timestamp")) or st["trailing_auth_ts"]
+            continue
+        if typ not in ("user", "assistant") or r.get("isSidechain"):
+            continue
+        st["trailing_auth_ts"] = None
+        st["last_ts"] = parse_ts(r.get("timestamp")) or st["last_ts"]
+        m = r.get("message") if isinstance(r.get("message"), dict) else {}
+        c = m.get("content")
+        if typ == "assistant":
+            mod = m.get("model")
+            if isinstance(mod, str) and mod != "<synthetic>" and not r.get("isApiErrorMessage"):
+                st["model"] = mod
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        open_tools.add(b.get("id"))
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    open_tools.discard(b.get("tool_use_id"))
+        last_conv = r
+    if last_conv is not None:
+        m = last_conv.get("message") if isinstance(last_conv.get("message"), dict) else {}
+        if last_conv["type"] == "assistant":
+            st["auth_error"] = bool(last_conv.get("isApiErrorMessage")) and bool(AUTH_RE.search(text_of(m)))
+            st["finished"] = (not open_tools and not st["auth_error"]
+                              and m.get("stop_reason") in (None, "end_turn", "stop_sequence"))
+        else:
+            # Escape key: Claude Code writes "[Request interrupted by user]": a deliberate stop.
+            st["finished"] = text_of(m).lstrip().startswith(INTERRUPTED)
+    st["pending_tool"] = bool(open_tools)
+    return st
+
+
+def last_activity(path):
+    """Latest write to the transcript or to those of its subagents."""
+    latest = mtime(path) or 0.0
+    for p in glob.glob(os.path.join(path[:-6], "**", "*.jsonl"), recursive=True):
+        latest = max(latest, mtime(p) or 0.0)
+    return latest
+
+
+def decide(st, agent, t, activity, absent_since):
+    """Reason to relay, or None. absent_since = time when Desktop left."""
+    ref = max(filter(None, [st["last_ts"], activity]), default=None)
+    if ref is None or t - ref > MAX_AGE_H * 3600:
+        return None
+    # The session had to be alive when Desktop left; otherwise it is an earlier stop (closed
+    # by hand, abandoned) that we do not restart.
+    if absent_since is not None and ref < absent_since - MARGIN_S:
+        return None
+    if st["auth_error"]:
+        return "auth"
+    if st.get("trailing_auth_ts") and t - st["trailing_auth_ts"] > 300:
+        return "auth"
+    if agent is None:
+        return None if st["finished"] else "dead"
+    recent = activity is not None and t - activity < WAIT_MIN * 60
+    if agent.get("status") == "waiting" and not recent:
+        return "waiting"
+    return None
+
+
+# ----------------------------------------------------------------------------- persistent state
+def load(name, default):
+    try:
+        with open(os.path.join(STATE_DIR, name), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(name, data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = os.path.join(STATE_DIR, name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, os.path.join(STATE_DIR, name))
+
+
+def already_handled(sid, st):
+    """A relayed session is not relayed again, unless the user resumed the original afterwards
+    (the conversation moved on since); a failed relay is retried up to MAX_ATTEMPTS."""
+    rec = load(sid + ".json", None)
+    if not rec:
+        return False
+    if rec.get("state") == "failed":
+        return rec.get("attempts", 1) >= MAX_ATTEMPTS
+    return not (st["last_ts"] and rec.get("last_ts") and st["last_ts"] > rec["last_ts"] + 60)
+
+
+# ----------------------------------------------------------------------------- relay
+def find_fork(prefix, label, live_before):
+    """Find the launched copy: sessionId starting with the short id, otherwise by its name."""
+    live = agents() or {}
+    for sid, a in live.items():
+        if prefix and sid.startswith(prefix):
+            return sid
+    for sid, a in live.items():
+        if a.get("name") == label and sid not in live_before:
+            return sid
+    return None
+
+
+def relay(sid, st, agent, reason, live):
+    name = (agent or {}).get("name") or st["name"] or sid[:8]
+    cwd = (agent or {}).get("cwd") or st["cwd"] or os.path.join(HOME, "dev")
+    if not os.path.isdir(cwd):
+        cwd = HOME
+    label = (PREFIX + name)[:60]
+    prev = load(sid + ".json", {}) or {}
+    record = {"session": sid, "name": name, "reason": reason, "when": iso(), "t": now(),
+              "last_ts": st["last_ts"], "cwd": cwd, "model": st["model"], "relay": None,
+              "relay_sid": None, "state": "failed", "attempts": (prev.get("attempts", 0) + 1
+                                                                 if prev.get("state") == "failed" else 1)}
+    if DRY:
+        log(f"[dry-run] would relay {sid[:8]} \"{name}\" ({reason})")
+        return
+    # A copy with this name is already running (previous relay whose output was not read): do
+    # not launch again, just attach to it.
+    for fsid, a in live.items():
+        if a.get("name") == label:
+            record.update(state="launched", relay=fsid[:8], relay_sid=fsid, output="copy already present")
+            save(sid + ".json", record)
+            return
+    cmd = [CLAUDE, "--resume", sid, "--fork-session", "--bg", "--remote-control", label,
+           "--name", label, "--permission-mode", "auto"]
+    if st["model"]:
+        cmd += ["--model", st["model"]]
+    cmd.append(PROMPT.format(reason=REASONS[reason], time=iso(st["last_ts"])))
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("ANTHROPIC_", "CLAUDE_CODE_", "CLAUDE_SSH", "RELAY_"))}
+    env["PATH"] = os.path.join(HOME, ".local", "bin") + ":" + env.get("PATH", "/usr/bin:/bin")
+    try:
+        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=120)
+        out = ((p.stdout or "") + (p.stderr or "")).strip()
+        m = re.search(r"backgrounded\s*·\s*([0-9a-f]{6,})", out)
+        short = m.group(1) if m else None
+        record["output"] = out[-400:]
+    except (OSError, subprocess.TimeoutExpired) as e:
+        short = None
+        record["output"] = f"launch failed: {e}"
+    fork = find_fork(short, label, live)
+    if fork:
+        record.update(state="launched", relay=fork[:8], relay_sid=fork)
+        # The copy exists: only now do we stop the original (stuck or without a token) so
+        # that it does not start again in parallel if Desktop comes back.
+        pid = (agent or {}).get("pid")
+        if pid and reason in ("auth", "waiting") and pid_alive(pid):
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+    save(sid + ".json", record)
+    if fork:
+        msg = (f"session \"{name}\" ({sid[:8]}) relayed ({REASONS[reason]}) -> background session "
+               f"{fork[:8]} \"{label}\", visible on claude.ai/code; `claude attach {fork[:8]}`")
+    else:
+        msg = (f"FAILED to relay \"{name}\" ({sid[:8]}, {REASONS[reason]}, attempt "
+               f"{record['attempts']}/{MAX_ATTEMPTS}): {record['output'][-200:]}")
+    log(msg)
+    write_log_file(msg)
+
+
+def tick(status_only=False):
+    t = now()
+    present = desktop_present() and not FORCE_ABSENT
+    absence = load("absence.json", {"since": None})
+    if present:
+        absence["since"] = None
+    elif absence.get("since") is None:
+        absence["since"] = t
+    if not status_only:
+        save("absence.json", absence)
+    absent_since = None if present else absence["since"]
+    absent_min = 0 if present else (t - absent_since) / 60
+    if FORCE_ABSENT:
+        absent_min = max(absent_min, ABSENCE_MIN)
+    live = agents()
+    if live is None:
+        if status_only:
+            print("claude agents --json is not responding: nothing is decided this pass")
+        return
+    cmap = children_map() if status_only else None
+    lines = [f"Desktop: {'connected' if present else f'absent for {absent_min:.0f} min'}"]
+    paths = {}
+    for path in glob.glob(os.path.join(PROJECTS, "*", "*.jsonl")):
+        sid = os.path.basename(path)[:-6]
+        m = mtime(path)
+        if ID_RE.match(sid) and (sid in live or (m and t - m < MAX_AGE_H * 3600)):
+            paths[sid] = path
+    for sid, path in sorted(paths.items()):
+        try:
+            agent = live.get(sid)
+            if (agent or {}).get("name", "").startswith(PREFIX):
+                continue   # a relayed copy is never relayed in turn
+            if sid not in TEST_IDS and head_entrypoint(path) != "claude-desktop":
+                continue
+            st = analyze_file(path)
+            if not st or (st["name"] or "").startswith(PREFIX):
+                continue
+            activity = last_activity(path)
+            handled = already_handled(sid, st)
+            reason = decide(st, agent, t, activity, absent_since if not FORCE_ABSENT else None)
+            if status_only:
+                running = bool(agent and any("shell-snapshots" in cmdline(d)
+                                             for d in descendants(agent.get("pid", -1), cmap)))
+                lines.append(f"  {sid[:8]} \"{(agent or {}).get('name') or st['name'] or '?'}\" "
+                             f"process={'yes' if agent else 'no'} status={(agent or {}).get('status', '-')} "
+                             f"finished={st['finished']} open_tool={st['pending_tool']} command={running} "
+                             f"auth_error={st['auth_error'] or bool(st.get('trailing_auth_ts'))} "
+                             f"-> {'already handled' if handled else (reason or 'nothing')}")
+                continue
+            if handled or not reason:
+                continue
+            if absent_min >= ABSENCE_MIN:
+                relay(sid, st, agent, reason, live)
+        except Exception as e:   # one unreadable session must not block the others
+            log(f"session {sid[:8]} skipped this pass: {e!r}")
+    if status_only:
+        print("\n".join(lines))
+
+
+# ----------------------------------------------------------------------------- guard hook
+def last_reply(fork_sid, max_chars=700):
+    """(time, text) of the relayed copy's last reply, read from the end of its transcript
+    (the last 400 KB are enough), or None."""
+    if not isinstance(fork_sid, str) or not ID_RE.match(fork_sid):
+        return None
+    path = transcript_path(fork_sid)
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 400_000))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict) or r.get("type") != "assistant" or r.get("isApiErrorMessage"):
+            continue
+        text = text_of(r.get("message")).strip()
+        if text:
+            ts = parse_ts(r.get("timestamp"))
+            when = datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "?"
+            text = " ".join(text.split())
+            return when, (text[:max_chars] + "...") if len(text) > max_chars else text
+    return None
+
+
+def guard():
+    """SessionStart hook: if this session was relayed recently, tell Claude as soon as it
+    opens. Never blocks, prints nothing otherwise."""
+    try:
+        data = json.load(sys.stdin)
+    except (ValueError, OSError):
+        return
+    sid = data.get("session_id") if isinstance(data, dict) else None
+    if not isinstance(sid, str) or not ID_RE.match(sid):
+        return
+    rec = load(sid + ".json", None)
+    if not isinstance(rec, dict) or now() - float(rec.get("t") or 0) > MAX_AGE_H * 3600:
+        return
+    when = rec.get("when")
+    reason = REASONS.get(rec.get("reason"), rec.get("reason"))
+    if rec.get("state") == "launched" and rec.get("relay"):
+        follow_up = last_reply(rec.get("relay_sid"))
+        if follow_up:
+            at, text = follow_up
+            news = (f"The copy's last reply ({at}), to pass on to the user as is: "
+                    f"\"{text}\"")
+        else:
+            news = "The copy has not replied yet (it may still be working)."
+        ctx = (f"WARNING: this session was cut off on {when} while the user's PC was off "
+               f"({reason}), and devbox-relay resumed it in the background under the name "
+               f"\"{PREFIX}{rec.get('name')}\" (id {rec['relay']}: `claude agents`, "
+               f"`claude attach {rec['relay']}`, or claude.ai/code). The work continued there. "
+               f"{news} Do NOT run any command and do not modify anything, not even to check "
+               "(files may have been moved since): tell the user that the session was relayed, "
+               "what the copy replied and where to find it, then wait for their answer. "
+               "Otherwise the task would be done twice.")
+    else:
+        ctx = (f"Note: on {when}, devbox-relay tried to resume this session in the background "
+               f"({reason}) but the launch failed. Check with `claude agents` and "
+               "~/dev/_relay/log.md before resuming, and tell the user.")
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}},
+                     ensure_ascii=False))
+
+
+# ----------------------------------------------------------------------------- tests
+def _rec(kind, content, ts, **kw):
+    r = {"type": kind, "timestamp": ts, "message": {"role": kind, "content": content}}
+    r["message"].update(kw.pop("msg", {}))
+    r.update(kw)
+    return r
+
+
+def self_test():
+    T0 = "2026-11-09T08:00:00.000Z"
+    base = [{"type": "user", "entrypoint": "claude-desktop", "cwd": "/home/user/dev", "timestamp": T0,
+             "message": {"role": "user", "content": "do X"}}]
+    finished = base + [_rec("assistant", [{"type": "text", "text": "done"}], T0,
+                            msg={"model": "claude-opus-5-5", "stop_reason": "end_turn"})]
+    tool = base + [_rec("assistant", [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}], T0,
+                        msg={"model": "claude-opus-5-5", "stop_reason": "tool_use"})]
+    result = tool + [_rec("user", [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}], T0)]
+    interrupted = tool + [_rec("user", [{"type": "text", "text": "[Request interrupted by user for tool use]"}], T0)]
+    auth = result + [_rec("assistant", [{"type": "text", "text": "API Error: 401 OAuth token has expired. Please run /login"}],
+                          T0, isApiErrorMessage=True, msg={"model": "<synthetic>"})]
+    other_err = result + [_rec("assistant", [{"type": "text", "text": "API Error: 529 overloaded"}], T0,
+                               isApiErrorMessage=True, msg={"model": "<synthetic>"})]
+    retries = result + [
+        {"type": "system", "subtype": "api_error", "timestamp": T0, "retryAttempt": n,
+         "error": {"status": 401, "formatted": "401 OAuth access token has expired. Re-authenticate to continue."}}
+        for n in (1, 2, 3)]
+    resumed = retries + [_rec("assistant", [{"type": "text", "text": "continuing"}], T0,
+                              msg={"model": "claude-opus-5-5", "stop_reason": "end_turn"})]
+    t0 = parse_ts(T0)
+    t = t0 + 3600
+    alive = {"pid": 999999, "status": "busy"}
+    waiting = {"pid": 999999, "status": "waiting"}
+    left = t0 + 300              # Desktop left 5 min after the last activity
+    cases = [
+        ("turn finished, process alive", finished, alive, left, None),
+        ("turn finished, process dead", finished, None, left, None),
+        ("tool without result, process alive and busy", tool, alive, left, None),
+        ("pending tool, process dead", tool, None, left, "dead"),
+        ("tool result without reply, process dead", result, None, left, "dead"),
+        ("interrupted with Escape, process dead", interrupted, None, left, None),
+        ("401 error last", auth, alive, left, "auth"),
+        ("other API error, process alive", other_err, alive, left, None),
+        ("series of 401s with no recovery", retries, alive, left, "auth"),
+        ("series of 401s then successful recovery", resumed, alive, left, None),
+        ("status waiting for a long time", tool, waiting, left, "waiting"),
+        ("session dead long before Desktop left", tool, None, t0 + 3 * 3600, None),
+    ]
+    ok = True
+    for name, recs, ag, since, expected in cases:
+        got = decide(analyze(recs), ag, t, None, since)
+        ok &= got == expected
+        print(f"{'OK  ' if got == expected else 'FAIL'} {name}: {got} (expected {expected})")
+    st = analyze(finished)
+    good = st["model"] == "claude-opus-5-5" and st["entrypoint"] == "claude-desktop"
+    ok &= good
+    print(("OK  " if good else "FAIL"), "model and entrypoint read:", st["model"], st["entrypoint"])
+    old = decide(analyze(tool), None, t0 + 2 * 86400, None, None)
+    ok &= old is None
+    print(("OK  " if old is None else "FAIL"), "session older than a day ignored:", old)
+    return 0 if ok else 1
+
+
+# ----------------------------------------------------------------------------- main
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "loop":
+        log(f"devbox-relay starting (absence {ABSENCE_MIN:g} min, wait {WAIT_MIN:g} min"
+            f"{', DRY-RUN' if DRY else ''})")
+        while True:
+            try:
+                tick()
+            except Exception as e:   # the service must never die
+                log(f"error: {e!r}")
+            time.sleep(INTERVAL)
+    elif cmd == "status":
+        tick(status_only=True)
+    elif cmd == "once":
+        tick()
+    elif cmd == "guard":
+        try:
+            guard()
+        except Exception:
+            pass   # a guard hook must never get in the way of opening a session
+    elif cmd == "test":
+        sys.exit(self_test())
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

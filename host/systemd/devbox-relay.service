@@ -1,0 +1,15 @@
+[Unit]
+Description=devbox-relay: resume cut-off Desktop sessions in the background when the PC is off
+
+[Service]
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/.local/bin/devbox-relay loop
+Restart=always
+RestartSec=10
+# Relayed copies (claude --bg) inherit the service's cgroup: do not kill them
+# when the service restarts.
+KillMode=process
+
+[Install]
+WantedBy=default.target

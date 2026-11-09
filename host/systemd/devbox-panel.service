@@ -1,0 +1,14 @@
+[Unit]
+Description=Bottom bar of screen :1 (tint2) with the logged-in Chrome icon
+Requires=devbox-vnc.service
+After=devbox-vnc.service devbox-wm.service
+
+[Service]
+Environment=DISPLAY=:1
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 50); do [ -S /tmp/.X11-unix/X1 ] && exit 0; sleep 0.2; done; exit 1'
+ExecStart=/usr/bin/tint2 -c %h/.config/tint2/tint2rc
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# devbox-chrome: starts the host's "logged-in" Chrome in the virtual screen :1.
+# Called by the systemd --user services devbox-chrome (--cdp) and devbox-chrome-login (--login).
+#   --cdp           debugging port 127.0.0.1:9222 open, for Playwright MCP (the "chrome" server)
+#   --login         no debugging port, so you can log in to your accounts (Google often refuses
+#                   a login in a Chrome that has this port open)
+#   --window [url]  opens a new window in the Chrome that is already running
+#
+# Browser binary: $DEVBOX_CHROME_BIN if set, else google-chrome-stable, else the newest
+# Playwright Chromium (~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome). The last
+# one is what arm64 hosts use (Google Chrome has no Linux arm64 build; arm64 is best
+# effort, not tested end to end).
+set -euo pipefail
+
+MODE="${1:---cdp}"
+PROFILE="${DEVBOX_CHROME_PROFILE:-$HOME/.config/devbox-chrome}"
+export DISPLAY="${DISPLAY:-:1}"
+mkdir -p "$PROFILE"
+
+if [ -n "${DEVBOX_CHROME_BIN:-}" ]; then
+  BIN="$DEVBOX_CHROME_BIN"
+  [ -x "$BIN" ] || { echo "DEVBOX_CHROME_BIN is not executable: $BIN" >&2; exit 1; }
+elif command -v google-chrome-stable >/dev/null 2>&1; then
+  BIN="$(command -v google-chrome-stable)"
+else
+  # No Google Chrome: take the newest Playwright Chromium.
+  BIN="$(ls -d "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux*/chrome 2>/dev/null | sort -V | tail -n1 || true)"
+  [ -n "$BIN" ] || { echo "No Chrome/Chromium found" >&2; exit 1; }
+fi
+
+# Wait for the virtual screen to be ready.
+for _ in $(seq 1 50); do [ -S /tmp/.X11-unix/X1 ] && break; sleep 0.2; done
+
+ARGS=(
+  --user-data-dir="$PROFILE"   # dedicated profile: Chrome 136+ refuses the debugging port on the default profile
+  --no-first-run
+  --no-default-browser-check
+  --password-store=basic       # no GNOME keyring on a server
+  --hide-crash-restore-bubble
+  "--window-position=0,0"
+  "--window-size=1600,900"
+)
+case "$MODE" in
+  --cdp)   ARGS+=(--remote-debugging-port=9222) ;;   # listens on 127.0.0.1 only
+  --login) ;;
+  --window)
+    # New window in the Chrome already started by systemd (same profile: Chrome
+    # hands the request to the existing process and returns immediately).
+    shift || true
+    exec "$BIN" --user-data-dir="$PROFILE" --new-window "$@"
+    ;;
+  *) echo "Usage: devbox-chrome [--cdp|--login|--window [url]]" >&2; exit 2 ;;
+esac
+
+exec "$BIN" "${ARGS[@]}"

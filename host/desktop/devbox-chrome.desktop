@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Chrome (your accounts)
+Comment=The host's Chrome logged in to your accounts, driven by Claude
+Exec=@HOME@/.local/bin/devbox-browser open %U
+Icon=google-chrome
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=false

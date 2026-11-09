@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# claude-task: long Claude Code sessions in tmux that keep running while your computer is off.
+# Claude subscription (claude.ai login), never an API key.
+#
+#   claude-task start <name> <folder> "<instruction>" [--mode <mode>] [--model <model>] [--rc]
+#        --mode  : manual | acceptEdits (default) | plan | auto | dontAsk
+#        --model : sonnet, haiku... (default: Claude Code's own default)
+#        --rc    : Remote Control, to follow the session on claude.ai/code or on a phone
+#   claude-task list                       sessions, and whether Claude is still running in them
+#   claude-task show <name> [lines]        last lines of the session's screen
+#   claude-task send <name> "<text>"       types a message into the session (then Enter)
+#   claude-task stop <name>
+#
+# With --mode acceptEdits, Claude edits files on its own but asks before running
+# commands: the session then waits for an answer (claude-task show / send, or --rc).
+# When Claude exits, the session stays open on a shell (claude-task stop).
+set -euo pipefail
+
+die() { echo "[error] $*" >&2; exit 1; }
+PREFIX="ct-"
+# Selection marker that Claude Code draws in its menus (U+276F), written as bytes to keep this file ASCII.
+MARKER=$'\xe2\x9d\xaf'
+
+check_name() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "Invalid name '${1:-}' (letters, digits, _ and - only)."
+}
+# "=" before the target: tmux requires the exact name (otherwise it accepts a prefix).
+target() { printf '=%s%s' "$PREFIX" "$1"; }        # for has-session, kill-session
+pane()   { printf '=%s%s:' "$PREFIX" "$1"; }       # for send-keys, capture-pane
+exists() { tmux has-session -t "$(target "$1")" 2>/dev/null; }
+
+need_login() {
+  [ -s "$HOME/.claude/.credentials.json" ] || die "Claude Code is not logged in on this host. Once, by hand: run claude, then /login (open the link on your computer)."
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  start)
+    name="${1:-}"; dir="${2:-}"; prompt="${3:-}"
+    [ -n "$name" ] && [ -n "$dir" ] && [ -n "$prompt" ] || die 'Usage: claude-task start <name> <folder> "<instruction>" [--mode m] [--model m] [--rc]'
+    check_name "$name"
+    shift 3
+    mode="acceptEdits"; rc=0; model=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --mode) mode="${2:-}"; shift 2 ;;
+        --rc)   rc=1; shift ;;
+        --model) model="${2:-}"; shift 2 ;;
+        *) die "Unknown option: $1" ;;
+      esac
+    done
+    case "$mode" in manual|acceptEdits|plan|auto|dontAsk) ;; *) die "Mode not allowed: $mode" ;; esac
+    [ -z "$model" ] || [[ "$model" =~ ^[A-Za-z0-9._-]{1,60}$ ]] || die "Invalid model: $model"
+    [ -d "$dir" ] || die "Folder not found: $dir"
+    dir="$(cd "$dir" && pwd)"
+    need_login
+    exists "$name" && die "Session $name already exists (claude-task show $name)."
+    session="$PREFIX$name"
+
+    args=(claude --name "$name" --permission-mode "$mode")
+    [ -n "$model" ] && args+=(--model "$model")
+    [ "$rc" = 1 ] && args+=(--remote-control "$name")
+    args+=("$prompt")
+    # env -u: an API key in the environment would bill the API instead of the subscription.
+    printf -v launch '%q ' env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${args[@]}"
+    tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
+    tmux send-keys -t "$(pane "$name")" -l -- "$launch"
+    tmux send-keys -t "$(pane "$name")" Enter
+
+    # First launch in a folder: Claude asks whether to trust the files.
+    # The default choice is "No, exit": move down to "Yes, I trust this folder"
+    # (the line marked with the selection marker) before confirming. The typed command line is ignored.
+    trust_seen=0
+    for _ in $(seq 1 30); do
+      sleep 1
+      screen="$(tmux capture-pane -p -t "$(pane "$name")" 2>/dev/null | grep -vF 'claude --name' || true)"
+      if grep -qiE 'yes, i trust this folder|yes, proceed' <<<"$screen"; then
+        for _ in 1 2 3; do
+          cur="$(tmux capture-pane -p -t "$(pane "$name")" 2>/dev/null | grep -F "$MARKER" | grep -iE 'yes|no' | tail -n1 || true)"
+          grep -qi 'yes' <<<"$cur" && break
+          tmux send-keys -t "$(pane "$name")" Down
+          sleep 0.5
+        done
+        cur="$(tmux capture-pane -p -t "$(pane "$name")" 2>/dev/null | grep -F "$MARKER" | grep -iE 'yes|no' | tail -n1 || true)"
+        grep -qi 'yes' <<<"$cur" || die "Could not select 'Yes' in the folder trust question: tmux attach -t $session"
+        tmux send-keys -t "$(pane "$name")" Enter
+        trust_seen=1
+        sleep 3
+        break
+      fi
+    done
+    echo "Session '$name' started in $dir (mode $mode$( [ "$rc" = 1 ] && echo ', Remote Control' ))."
+    [ "$trust_seen" = 1 ] && echo "Folder trust question confirmed."
+    echo "Check that it is working: claude-task show $name    Join it: tmux attach -t $session"
+    ;;
+  list)
+    out="$(tmux list-sessions -F '#{session_name}|#{pane_current_command}|#{?session_attached,attached,}' 2>/dev/null || true)"
+    found=0
+    while IFS='|' read -r s current attached; do
+      [[ "$s" == "$PREFIX"* ]] || continue
+      found=1
+      if [ "$current" = "claude" ]; then state="Claude running"; else state="Claude exited ($current)"; fi
+      printf '%-24s %-28s %s\n' "${s#"$PREFIX"}" "$state" "$attached"
+    done <<<"$out"
+    [ "$found" = 1 ] || echo "No sessions."
+    ;;
+  show)
+    name="${1:-}"; lines="${2:-40}"
+    check_name "$name"
+    [[ "$lines" =~ ^[0-9]{1,5}$ ]] || die "Invalid number of lines: $lines"
+    exists "$name" || die "Session $name not found."
+    tmux capture-pane -p -t "$(pane "$name")" -S "-$lines"
+    ;;
+  send)
+    name="${1:-}"; text="${2:-}"
+    check_name "$name"
+    [ -n "$text" ] || die 'Usage: claude-task send <name> "<text>"'
+    exists "$name" || die "Session $name not found."
+    tmux send-keys -t "$(pane "$name")" -l -- "$text"
+    tmux send-keys -t "$(pane "$name")" Enter
+    ;;
+  stop)
+    name="${1:-}"
+    check_name "$name"
+    exists "$name" || die "Session $name not found."
+    tmux kill-session -t "$(target "$name")"
+    echo "Session $name stopped."
+    ;;
+  *)
+    sed -n '2,16p' "$0"
+    exit 2
+    ;;
+esac

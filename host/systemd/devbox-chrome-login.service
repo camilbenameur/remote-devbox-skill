@@ -1,0 +1,11 @@
+[Unit]
+Description=Logged-in Chrome, login mode (no debugging port)
+Requires=devbox-vnc.service
+After=devbox-vnc.service devbox-wm.service
+Conflicts=devbox-chrome.service
+
+[Service]
+Environment=DISPLAY=:1
+ExecStart=%h/.local/bin/devbox-chrome --login
+Restart=always
+RestartSec=3

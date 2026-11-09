@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# devbox-browser: manages the host's logged-in Chrome (your accounts) and its virtual screen.
+#   devbox-browser login       restart Chrome WITHOUT debugging port, so you can log in to your accounts
+#   devbox-browser normal      restart Chrome WITH port 9222, so Claude can drive it (MCP "chrome")
+#   devbox-browser status      service status, current mode, screen address
+#   devbox-browser password    print the screen's password (noVNC)
+#   devbox-browser open [url]  open a window of the logged-in Chrome (taskbar icon, right-click menu)
+set -euo pipefail
+
+say_screen() {
+  # Output captured: with pipefail, grep -q can cut off ss (SIGPIPE) and skew the test.
+  local listening
+  listening="$(ss -H -ltn '( sport = :6080 )' 2>/dev/null || true)"
+  if grep -q ' 100\.' <<<"$listening"; then
+    cat <<'EOF'
+To see the screen from one of your Tailscale machines:
+  http://devbox:6080/vnc.html  (password: devbox-browser password)
+EOF
+  else
+    cat <<'EOF'
+To see the screen from your computer:
+  ssh -N -L 6080:localhost:6080 devbox
+then open http://localhost:6080/vnc.html  (password: devbox-browser password)
+EOF
+  fi
+}
+
+case "${1:-status}" in
+  login)
+    # stop is blocking: the old Chrome has released the profile before the new one starts.
+    systemctl --user stop devbox-chrome.service
+    systemctl --user start devbox-chrome-login.service
+    echo "Chrome restarted in login mode (no debugging port: Claude cannot drive it)."
+    say_screen
+    echo "Once you are logged in to your accounts:  devbox-browser normal"
+    ;;
+  normal)
+    systemctl --user stop devbox-chrome-login.service
+    systemctl --user start devbox-chrome.service
+    for _ in $(seq 1 60); do
+      curl -fs http://127.0.0.1:9222/json/version >/dev/null 2>&1 && break
+      sleep 1
+    done
+    if curl -fs http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
+      echo "Chrome restarted in normal mode: Claude can drive it (MCP \"chrome\")."
+    else
+      echo "Chrome is not answering on 127.0.0.1:9222: journalctl --user -u devbox-chrome -n 50" >&2
+      exit 1
+    fi
+    ;;
+  status)
+    for u in devbox-vnc devbox-wm devbox-novnc devbox-chrome devbox-chrome-login; do
+      printf '%-22s %s\n' "$u" "$(systemctl --user is-active "$u.service" 2>/dev/null || true)"
+    done
+    if curl -fs http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
+      echo "Mode: normal (port 9222 open locally)"
+    else
+      echo "Mode: login or stopped (port 9222 closed)"
+    fi
+    say_screen
+    ;;
+  password)
+    cat "$HOME/.config/devbox/vnc-password"
+    ;;
+  open)
+    # Opens a window of the logged-in Chrome (taskbar icon, openbox menu, default
+    # browser). If neither service is running, start normal mode first.
+    if ! systemctl --user is-active --quiet devbox-chrome.service \
+       && ! systemctl --user is-active --quiet devbox-chrome-login.service; then
+      systemctl --user start devbox-chrome.service
+    fi
+    for _ in $(seq 1 30); do
+      pgrep -u "$(id -u)" -f -- '--user-data-dir=.*devbox-chrome' >/dev/null && break
+      sleep 0.5
+    done
+    shift
+    exec "$HOME/.local/bin/devbox-chrome" --window "$@"
+    ;;
+  *)
+    sed -n '2,7p' "$0"
+    exit 2
+    ;;
+esac

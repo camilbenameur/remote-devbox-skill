@@ -1,0 +1,14 @@
+[Unit]
+Description=Logged-in Chrome, driven by Claude (CDP 127.0.0.1:9222)
+Requires=devbox-vnc.service
+After=devbox-vnc.service devbox-wm.service
+Conflicts=devbox-chrome-login.service
+
+[Service]
+Environment=DISPLAY=:1
+ExecStart=%h/.local/bin/devbox-chrome --cdp
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

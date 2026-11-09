@@ -1,0 +1,12 @@
+[Unit]
+Description=noVNC: screen :1 in a browser, port 6080 on the Tailscale address (else 127.0.0.1)
+Requires=devbox-vnc.service
+After=devbox-vnc.service
+
+[Service]
+ExecStart=%h/.local/bin/devbox-novnc
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

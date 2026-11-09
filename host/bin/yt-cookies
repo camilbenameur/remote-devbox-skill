@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# yt-cookies: exports the YouTube/Google cookies of the host's logged-in Chrome to
+# ~/.config/devbox/youtube-cookies.txt (Netscape format, readable by you only).
+# YouTube refuses server IPs without cookies ("Sign in to confirm you're not a bot").
+# Then, with a video-transcript style tool:
+#   python transcript.py <url> --cookies ~/.config/devbox/youtube-cookies.txt
+# Run yt-cookies again if YouTube refuses again (cookies expired or renewed).
+set -euo pipefail
+
+PROFILE="${DEVBOX_CHROME_PROFILE:-$HOME/.config/devbox-chrome}/Default"
+OUT="$HOME/.config/devbox/youtube-cookies.txt"
+YTDLP="${YTDLP:-$HOME/.claude/skills/video-transcript/.venv/bin/yt-dlp}"
+command -v "$YTDLP" >/dev/null 2>&1 || YTDLP="$(command -v yt-dlp || true)"
+[ -n "$YTDLP" ] || { echo "yt-dlp not found" >&2; exit 1; }
+
+umask 077
+mkdir -p "$(dirname "$OUT")"
+# The file must not exist at the start: yt-dlp refuses to read an empty file as a cookie jar.
+tmpd="$(mktemp -d)"
+tmp="$tmpd/jar.txt"
+trap 'rm -rf "$tmpd"' EXIT
+# yt-dlp reads the Chrome profile (copy of its database, Chrome may be running) and writes the full jar.
+"$YTDLP" --cookies-from-browser "chrome+basictext:$PROFILE" --cookies "$tmp" \
+  --skip-download --quiet --no-warnings --print id "https://www.youtube.com/watch?v=jNQXAC9IVRw" >/dev/null
+# Keep only YouTube and Google.
+{ echo "# Netscape HTTP Cookie File"; grep -E '^(#HttpOnly_)?\.?(([a-z0-9-]+\.)*youtube\.com|([a-z0-9-]+\.)*google\.com)[[:space:]]' "$tmp" || true; } > "$OUT"
+chmod 600 "$OUT"
+echo "$(($(wc -l < "$OUT") - 1)) YouTube/Google cookies written to $OUT"

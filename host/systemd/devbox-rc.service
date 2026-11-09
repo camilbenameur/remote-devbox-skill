@@ -1,0 +1,16 @@
+[Unit]
+Description=Remote Control server: sessions started from claude.ai/code or the Claude app, on this host (~/dev)
+After=network-online.target
+
+[Service]
+Type=forking
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/dev
+# tmux provides the terminal that "claude remote-control" requires; separate socket (-L rc).
+ExecStart=/usr/bin/tmux -L rc new-session -d -s rc -x 200 -y 50 -c %h/dev "claude remote-control --name devbox --remote-control-session-name-prefix devbox --permission-mode auto --spawn same-dir --capacity 6"
+ExecStop=/usr/bin/tmux -L rc kill-server
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

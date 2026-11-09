@@ -1,0 +1,10 @@
+[Unit]
+Description=Virtual screen :1 for the logged-in Chrome (TigerVNC, local only)
+
+[Service]
+ExecStart=/usr/bin/Xtigervnc :1 -localhost -rfbport 5901 -SecurityTypes VncAuth -PasswordFile %h/.config/tigervnc/passwd -geometry 1600x900 -depth 24 -AlwaysShared
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
