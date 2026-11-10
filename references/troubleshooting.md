@@ -33,6 +33,14 @@ Problems met while building the reference setup, with their fix.
 | noVNC unreachable | It listens on the Tailscale address only. Without Tailscale: `ssh -N -L 6080:localhost:6080 devbox`. |
 | YouTube: "Sign in to confirm you're not a bot" | Datacenter IPs are blocked. `yt-cookies` exports the YouTube cookies of the logged-in Chrome to `~/.config/devbox/youtube-cookies.txt`; pass `--cookies` to yt-dlp, and install Deno (recent yt-dlp needs a JavaScript runtime for YouTube). |
 
+## File share
+
+| Symptom | Cause and fix |
+|---|---|
+| Windows asks for credentials again and again | Windows first tries the Windows account. Give the user name as `devbox\<user>` (or `<tailscale-ip>\<user>`) and the password set with `smbpasswd -a`. |
+| "The network path was not found" | Tailscale is off on the computer, or the name does not resolve: use `\\<tailscale-ip>\<user>`. Check `Test-NetConnection devbox -Port 445`. |
+| Access denied right after setup | No SMB account yet: `sudo smbpasswd -a <user>` on the devbox. SMB passwords are separate from Linux ones. |
+
 ## Sessions
 
 | Symptom | Cause and fix |

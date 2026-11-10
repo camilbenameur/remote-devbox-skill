@@ -159,7 +159,11 @@ Goal: a session on the devbox behaves like one on the computer.
    (without `.venv`, `node_modules`, `.git`), and with `-Memory` copies the auto-memory of the
    local projects folder (`-LocalDevDir`, default `~/Documents/dev`) to the memory of `~/dev` on the
    devbox. Re-run it whenever the local CLAUDE.md or skills change. Edit the header template, not
-   the copy on the devbox, which is overwritten.
+   the copy on the devbox, which is overwritten. Careful: the skills merge overwrites files that
+   were fixed for Linux on the devbox (step 2). Make those fixes portable on the computer side
+   (both paths, or paths relative to the skill), or re-run with `-SkipSkills` / `--skip-skills`.
+   Likewise `-Memory` overwrites memory files of the same name that devbox sessions updated:
+   compare first on a devbox in use.
 2. **Skills that need setup**: for each synced skill, look for Python environments
    (`requirements.txt`, `pyproject.toml`), Node packages, binaries and Windows paths in `SKILL.md`.
    Recreate environments on the devbox and fix paths. Install system tools they need (for example
@@ -197,6 +201,21 @@ Goal: a session on the devbox behaves like one on the computer.
    `~/dev/_relay/log.md` shows the relay, `claude agents` on the devbox shows `relay · <name>`, and
    the reopened original session says it was relayed.
 
+## Phase 7b (optional): the devbox's files in the computer's file manager
+
+Sessions write reports, PDFs and images on the devbox, where the user cannot open them from the
+desktop app. Offer an SMB share of the dev user's home, reachable only from the tailnet (SMB3 with
+signing and encryption, no guest, ufw drops everything that is not on `tailscale0`):
+
+1. `ssh -t devbox 'sudo bash ~/devbox-setup/40-file-share.sh <user>'`
+2. The user picks a password used only for this share: `ssh -t devbox sudo smbpasswd -a <user>`.
+3. The user maps it. Windows: `net use Z: \\devbox\<user> /persistent:yes`, user name
+   `devbox\<user>` (or Explorer, This PC, Map network drive). macOS: Finder, Go, Connect to Server,
+   `smb://devbox/<user>`. If `devbox` does not resolve, use the address from `tailscale ip -4`.
+
+Files keep their Linux owner, so sessions and the user can edit the same files. Remind the user that
+anything on this drive can be read and changed by every session on the devbox.
+
 ## Phase 8: final check
 
 Run and report each line:
@@ -221,5 +240,6 @@ Then tell the user what is ready, what they still have to do, and how to reach e
 - Hand a session to the background on purpose:
   `claude --resume <id> --fork-session --bg --remote-control "<name>" --permission-mode auto "<prompt>"`.
 - Relay activity: `ssh devbox devbox-relay status`, log in `~/dev/_relay/log.md`.
+- Open a file a session wrote: the mapped drive from Phase 7b (for example `Z:\dev\<project>\...`).
 - Update tools: `PW_MCP_VERSION=<v> INSTALL_GATEHAUL=1 GATEHAUL_VERSION=<tag> bash ~/devbox-setup/20-user-setup.sh`.
 - A powered-off server is usually still billed.

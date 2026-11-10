@@ -49,6 +49,7 @@ flowchart LR
 | `devbox-relay` | When your computer has been gone for 10 minutes and a session was cut (expired sign-in, dead process, permission question nobody answers), it resumes the session in the background with its whole conversation, as `relay · <name>`, visible in claude.ai/code and the phone app. When you come back, a hook tells the original session not to redo the work. |
 | `devbox-rc` | A Remote Control server: sessions you start from claude.ai/code or the phone app run on the server from the first message. |
 | `claude-task` | Long Claude Code sessions in tmux that agents can start, read and answer. |
+| File share (optional) | The server's home folder as a network drive on your computer (`Z:` in Explorer, Finder on macOS), over Tailscale only, to open what sessions write. |
 | Config mirroring | Your global `CLAUDE.md` (with a header that explains the server to Claude), skills, memory and plugin hooks, copied over. |
 | Hardening | Key-only SSH restricted to one user, public port 22 closed once Tailscale works, ufw, fail2ban, unattended upgrades, a guard against API keys. |
 
@@ -123,6 +124,7 @@ and [references/troubleshooting.md](references/troubleshooting.md) for known pro
 | `host/10-root-bootstrap.sh` | System, security and packages (root); `--lock-ssh` restricts SSH to the dev user |
 | `host/20-user-setup.sh` | User tools, MCP servers, screen, relay, Remote Control |
 | `host/30-root-lockdown.sh` | Closes public SSH once Tailscale works |
+| `host/40-file-share.sh` | Optional: SMB share of the home folder, tailnet only |
 | `host/bin/` | `devbox-browser`, `devbox-chrome`, `devbox-novnc`, `devbox-relay`, `claude-task`, `yt-cookies` |
 | `host/systemd/`, `host/desktop/` | User services; screen menu, task bar and browser shortcut |
 | `references/` | How it works, providers, troubleshooting, prompt for an autonomous migration session |

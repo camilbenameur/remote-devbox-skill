@@ -2,9 +2,10 @@
 # claude-task: long Claude Code sessions in tmux that keep running while your computer is off.
 # Claude subscription (claude.ai login), never an API key.
 #
-#   claude-task start <name> <folder> "<instruction>" [--mode <mode>] [--model <model>] [--rc]
+#   claude-task start <name> <folder> "<instruction>" [--mode <mode>] [--model <model>] [--env K=V]... [--rc]
 #        --mode  : manual | acceptEdits (default) | plan | auto | dontAsk
 #        --model : sonnet, haiku... (default: Claude Code's own default)
+#        --env   : environment variable for the session (repeatable), e.g. --env DISPLAY=:1
 #        --rc    : Remote Control, to follow the session on claude.ai/code or on a phone
 #   claude-task list                       sessions, and whether Claude is still running in them
 #   claude-task show <name> [lines]        last lines of the session's screen
@@ -37,15 +38,16 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   start)
     name="${1:-}"; dir="${2:-}"; prompt="${3:-}"
-    [ -n "$name" ] && [ -n "$dir" ] && [ -n "$prompt" ] || die 'Usage: claude-task start <name> <folder> "<instruction>" [--mode m] [--model m] [--rc]'
+    [ -n "$name" ] && [ -n "$dir" ] && [ -n "$prompt" ] || die 'Usage: claude-task start <name> <folder> "<instruction>" [--mode m] [--model m] [--env K=V] [--rc]'
     check_name "$name"
     shift 3
-    mode="acceptEdits"; rc=0; model=""
+    mode="acceptEdits"; rc=0; model=""; envs=()
     while [ $# -gt 0 ]; do
       case "$1" in
         --mode) mode="${2:-}"; shift 2 ;;
         --rc)   rc=1; shift ;;
         --model) model="${2:-}"; shift 2 ;;
+        --env)  [[ "${2:-}" =~ ^[A-Z_][A-Z0-9_]*=[^[:cntrl:]]*$ ]] || die "Invalid variable: ${2:-}"; envs+=("$2"); shift 2 ;;
         *) die "Unknown option: $1" ;;
       esac
     done
@@ -62,7 +64,7 @@ case "$cmd" in
     [ "$rc" = 1 ] && args+=(--remote-control "$name")
     args+=("$prompt")
     # env -u: an API key in the environment would bill the API instead of the subscription.
-    printf -v launch '%q ' env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${args[@]}"
+    printf -v launch '%q ' env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN "${envs[@]}" "${args[@]}"
     tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
     tmux send-keys -t "$(pane "$name")" -l -- "$launch"
     tmux send-keys -t "$(pane "$name")" Enter
