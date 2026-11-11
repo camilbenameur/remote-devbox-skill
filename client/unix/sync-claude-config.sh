@@ -20,7 +20,7 @@
 #   bash client/unix/sync-claude-config.sh [--alias devbox] [--skip-skills]
 #     [--local-dev-dir DIR] [--memory] [--share-root auto|none|PATH]
 #   --share-root: where this computer mounts the server's home (host/40-file-share.sh),
-#     so sessions there write file links that open here. auto (default) finds the mount.
+#     so sessions there also give file paths on this side. auto (default) finds the mount.
 set -euo pipefail
 
 ALIAS='devbox'
@@ -85,15 +85,13 @@ if [ -f "$src" ]; then
   fi
   if [ "$share" = none ]; then
     sed -e '/^@SHARE_BEGIN@$/,/^@SHARE_END@$/d' "$tpl" > "$tmp/header.md"
-    echo 'No mounted server share: file links rule left out.'
+    echo 'No mounted server share: share paths rule left out.'
   else
     share="${share%/}"
-    url="file://$(printf '%s' "$share" | sed 's/ /%20/g')"
     share_esc="$(printf '%s' "$share" | sed 's/[&|\\]/\\&/g')"
-    url_esc="$(printf '%s' "$url" | sed 's/[&|\\]/\\&/g')"
     sed -e '/^@SHARE_BEGIN@$/d' -e '/^@SHARE_END@$/d' \
-      -e "s|@SHARE_URL@|$url_esc|g" -e "s|@SHARE_ROOT@|$share_esc|g" "$tpl" > "$tmp/header.md"
-    echo "File links will point to $share"
+      -e "s|@SHARE_EXAMPLE@|$share_esc/dev/app/docs/report.md|g" -e "s|@SHARE_ROOT@|$share_esc|g" "$tpl" > "$tmp/header.md"
+    echo "Sessions will also give file paths under $share"
   fi
   sed -e "s|@ALIAS@|$ALIAS|g" -e "s|@LOCAL_DEV_DIR@|$dev_esc|g" "$tmp/header.md" > "$tmp/CLAUDE.md"
   tr -d '\r' < "$src" >> "$tmp/CLAUDE.md"

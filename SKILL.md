@@ -203,8 +203,8 @@ Goal: a session on the devbox behaves like one on the computer.
 
 ## Phase 7b (optional): the devbox's files in the computer's file manager
 
-Sessions write reports, PDFs and images on the devbox, where the user cannot open them from the
-desktop app. Offer an SMB share of the dev user's home, reachable only from the tailnet (SMB3 with
+Sessions write reports, PDFs and images on the devbox. The desktop app shows them only in its own
+file pane, and only inside the session's folders. Offer an SMB share of the dev user's home, reachable only from the tailnet (SMB3 with
 signing and encryption, no guest, ufw drops everything that is not on `tailscale0`):
 
 1. `ssh -t devbox 'sudo bash ~/devbox-setup/40-file-share.sh <user>'`
@@ -214,9 +214,11 @@ signing and encryption, no guest, ufw drops everything that is not on `tailscale
    `smb://devbox/<user>`. If `devbox` does not resolve, use the address from `tailscale ip -4`.
 
 4. Re-run `sync-claude-config` (Phase 6). It finds the mapped drive (`-ShareRoot` /
-   `--share-root` to set it by hand) and adds a rule to the devbox's `CLAUDE.md`: sessions there
-   link files as `file:///Z:/dev/...` instead of devbox paths, so a click opens them on the
-   computer.
+   `--share-root` to set it by hand) and adds a rule to the devbox's `CLAUDE.md`: next to each
+   file link (an absolute devbox path, which opens in the app's file pane), sessions give the
+   file's path on the share as text, e.g. `Z:\dev\app\report.md`. Links to the share itself do
+   not work: the app reads `file://` links as paths on the devbox and drops `vscode://` and other
+   schemes.
 
 Files keep their Linux owner, so sessions and the user can edit the same files. Remind the user that
 anything on this drive can be read and changed by every session on the devbox.

@@ -34,7 +34,7 @@
 
 .PARAMETER ShareRoot
   Where this computer mounts the server's home folder (host/40-file-share.sh), so that
-  sessions on the server write file links that open here. 'auto' (default) uses the
+  sessions on the server also give the path of a file on this side. 'auto' (default) uses the
   drive letter mapped to \\<alias>\..., 'none' leaves the rule out, or give it, e.g. Z:
 
 .EXAMPLE
@@ -82,12 +82,12 @@ try {
     }
     if ($share -eq 'none') {
       $header = [regex]::Replace($header, '(?ms)^@SHARE_BEGIN@\r?\n.*?^@SHARE_END@\r?\n', '')
-      Write-Host 'No mapped drive for the server share: file links rule left out.'
+      Write-Host 'No mapped drive for the server share: share paths rule left out.'
     } else {
       $share = $share.TrimEnd('\', '/')
       $header = [regex]::Replace($header, '(?m)^@SHARE_(BEGIN|END)@\r?\n', '')
-      $header = $header.Replace('@SHARE_URL@', 'file:///' + ($share -replace '\\', '/')).Replace('@SHARE_ROOT@', $share)
-      Write-Host "File links will point to $share"
+      $header = $header.Replace('@SHARE_EXAMPLE@', "$share\dev\app\docs\report.md").Replace('@SHARE_ROOT@', $share)
+      Write-Host "Sessions will also give file paths under $share"
     }
     $body = [IO.File]::ReadAllText($src)
     $text = ($header + $body) -replace "`r`n", "`n"

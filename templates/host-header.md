@@ -21,14 +21,17 @@ On this machine:
 - YouTube refuses the host's IP without cookies. For the video-transcript skill, add
   `--cookies ~/.config/devbox/youtube-cookies.txt`; if YouTube still refuses, regenerate the file
   with `yt-cookies` (cookies of the signed-in Chrome, never printed or copied elsewhere).
+- File links: when a reply references a file, link it by its absolute path on this host, with
+  `$HOME` written out: `[report.md](/home/<user>/dev/app/docs/report.md)`. A click opens it in the
+  desktop app's file pane, which reads it from this host over SSH. Do not write `~/` or relative
+  links, and never `file://`, `vscode://` or other schemes: the app turns `file://` into a path it
+  looks up on this host, and drops the other schemes. The pane only opens files inside this
+  session's folders: to show a file from elsewhere, copy it into the session's folder and say so.
 @SHARE_BEGIN@
-- File links: the user's computer sees this host's home folder as `@SHARE_ROOT@` (SMB share over
-  Tailscale). A link to a path on this host does not open on their side, so whenever a reply
-  references a file, link it through the share instead of the default local link: `~/<path>`
-  (`$HOME/<path>`) becomes `[<name>](@SHARE_URL@/<path>)`, with forward slashes and spaces written
-  `%20`. Example: `~/dev/app/docs/report.md` becomes
-  `[report.md](@SHARE_URL@/dev/app/docs/report.md)`. Folders work the same way. For a file outside
-  the home folder, copy it under `~` first if the user needs to open it, and say where.
+- The user's computer also sees this host's home folder as `@SHARE_ROOT@` (SMB share over
+  Tailscale). When they need a file in one of their own programs, add its path on that side as
+  code text, not as a link (the app does not open those): `~/dev/app/docs/report.md` is
+  `@SHARE_EXAMPLE@` there.
 @SHARE_END@
 - To show a dev server to the user: make it listen on 127.0.0.1:<port>, then give them the
   command to run on their own computer: `ssh -N -L <port>:localhost:<port> @ALIAS@`.
