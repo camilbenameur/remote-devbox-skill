@@ -213,6 +213,11 @@ signing and encryption, no guest, ufw drops everything that is not on `tailscale
    `devbox\<user>` (or Explorer, This PC, Map network drive). macOS: Finder, Go, Connect to Server,
    `smb://devbox/<user>`. If `devbox` does not resolve, use the address from `tailscale ip -4`.
 
+4. Re-run `sync-claude-config` (Phase 6). It finds the mapped drive (`-ShareRoot` /
+   `--share-root` to set it by hand) and adds a rule to the devbox's `CLAUDE.md`: sessions there
+   link files as `file:///Z:/dev/...` instead of devbox paths, so a click opens them on the
+   computer.
+
 Files keep their Linux owner, so sessions and the user can edit the same files. Remind the user that
 anything on this drive can be read and changed by every session on the devbox.
 

@@ -18,16 +18,19 @@
 #
 # Usage:
 #   bash client/unix/sync-claude-config.sh [--alias devbox] [--skip-skills]
-#     [--local-dev-dir DIR] [--memory]
+#     [--local-dev-dir DIR] [--memory] [--share-root auto|none|PATH]
+#   --share-root: where this computer mounts the server's home (host/40-file-share.sh),
+#     so sessions there write file links that open here. auto (default) finds the mount.
 set -euo pipefail
 
 ALIAS='devbox'
+SHARE_ROOT='auto'
 SKIP_SKILLS=0
 MEMORY=0
 LOCAL_DEV_DIR=''
 
 usage() {
-  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 fail() { printf '[error] %s\n' "$1" >&2; exit 1; }
@@ -39,6 +42,7 @@ while [ "$#" -gt 0 ]; do
     --skip-skills)   SKIP_SKILLS=1; shift ;;
     --local-dev-dir) need_arg "$@"; LOCAL_DEV_DIR="$2"; shift 2 ;;
     --memory)        MEMORY=1; shift ;;
+    --share-root)    need_arg "$@"; SHARE_ROOT="$2"; shift 2 ;;
     -h|--help)       usage 0 ;;
     *)               printf 'Unknown option: %s\n' "$1" >&2; usage 1 ;;
   esac
@@ -72,7 +76,26 @@ if [ -f "$src" ]; then
   tpl="$repo_dir/templates/host-header.md"
   [ -f "$tpl" ] || fail "Template not found: $tpl"
   dev_esc="$(printf '%s' "$LOCAL_DEV_DIR" | sed 's/[&|\\]/\\&/g')"
-  sed -e "s|@ALIAS@|$ALIAS|g" -e "s|@LOCAL_DEV_DIR@|$dev_esc|g" "$tpl" > "$tmp/CLAUDE.md"
+  # File-share links: auto = where the server share is mounted (macOS: //user@<alias>/... in mount).
+  share="$SHARE_ROOT"
+  if [ "$share" = auto ]; then
+    mnt="$(mount 2>/dev/null || true)"
+    share="$(printf '%s\n' "$mnt" | sed -n "s|^//[^ ]*@$ALIAS/[^ ]* on \(.*\) (.*|\1|p" | head -n 1)"
+    [ -n "$share" ] || share=none
+  fi
+  if [ "$share" = none ]; then
+    sed -e '/^@SHARE_BEGIN@$/,/^@SHARE_END@$/d' "$tpl" > "$tmp/header.md"
+    echo 'No mounted server share: file links rule left out.'
+  else
+    share="${share%/}"
+    url="file://$(printf '%s' "$share" | sed 's/ /%20/g')"
+    share_esc="$(printf '%s' "$share" | sed 's/[&|\\]/\\&/g')"
+    url_esc="$(printf '%s' "$url" | sed 's/[&|\\]/\\&/g')"
+    sed -e '/^@SHARE_BEGIN@$/d' -e '/^@SHARE_END@$/d' \
+      -e "s|@SHARE_URL@|$url_esc|g" -e "s|@SHARE_ROOT@|$share_esc|g" "$tpl" > "$tmp/header.md"
+    echo "File links will point to $share"
+  fi
+  sed -e "s|@ALIAS@|$ALIAS|g" -e "s|@LOCAL_DEV_DIR@|$dev_esc|g" "$tmp/header.md" > "$tmp/CLAUDE.md"
   tr -d '\r' < "$src" >> "$tmp/CLAUDE.md"
   run 'preparing ~/.claude' ssh "$ALIAS" \
     'mkdir -p ~/.claude && if [ -f ~/.claude/CLAUDE.md ] && [ ! -f ~/.claude/CLAUDE.md.bak ]; then cp ~/.claude/CLAUDE.md ~/.claude/CLAUDE.md.bak; fi'

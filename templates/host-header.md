@@ -21,6 +21,15 @@ On this machine:
 - YouTube refuses the host's IP without cookies. For the video-transcript skill, add
   `--cookies ~/.config/devbox/youtube-cookies.txt`; if YouTube still refuses, regenerate the file
   with `yt-cookies` (cookies of the signed-in Chrome, never printed or copied elsewhere).
+@SHARE_BEGIN@
+- File links: the user's computer sees this host's home folder as `@SHARE_ROOT@` (SMB share over
+  Tailscale). A link to a path on this host does not open on their side, so whenever a reply
+  references a file, link it through the share instead of the default local link: `~/<path>`
+  (`$HOME/<path>`) becomes `[<name>](@SHARE_URL@/<path>)`, with forward slashes and spaces written
+  `%20`. Example: `~/dev/app/docs/report.md` becomes
+  `[report.md](@SHARE_URL@/dev/app/docs/report.md)`. Folders work the same way. For a file outside
+  the home folder, copy it under `~` first if the user needs to open it, and say where.
+@SHARE_END@
 - To show a dev server to the user: make it listen on 127.0.0.1:<port>, then give them the
   command to run on their own computer: `ssh -N -L <port>:localhost:<port> @ALIAS@`.
 - Continuity when the user's computer is off, automatic:
