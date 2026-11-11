@@ -385,6 +385,30 @@ def find_fork(prefix, label, live_before):
     return None
 
 
+def pin_job(short):
+    """Pin a background session so the claude daemon never retires it after 8 h idle."""
+    if not short:
+        return
+    path = os.path.join(HOME, ".claude", "jobs", "pins.json")
+    try:
+        try:
+            with open(path, encoding="utf-8") as f:
+                pins = json.load(f)
+            if not isinstance(pins, list):
+                pins = []
+        except (OSError, ValueError):
+            pins = []
+        if short not in pins:
+            pins.append(short)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".relay.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(pins, f, indent=2)
+            os.replace(tmp, path)
+    except OSError as e:
+        log(f"could not pin {short}: {e}")
+
+
 def relay(sid, st, agent, reason, live):
     name = (agent or {}).get("name") or st["name"] or sid[:8]
     cwd = (agent or {}).get("cwd") or st["cwd"] or os.path.join(HOME, "dev")
@@ -425,6 +449,7 @@ def relay(sid, st, agent, reason, live):
         record["output"] = f"launch failed: {e}"
     fork = find_fork(short, label, live)
     if fork:
+        pin_job(short or fork[:8])
         record.update(state="launched", relay=fork[:8], relay_sid=fork)
         # The copy exists: only now do we stop the original (stuck or without a token) so
         # that it does not start again in parallel if Desktop comes back.

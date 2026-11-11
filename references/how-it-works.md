@@ -61,6 +61,10 @@ A small stdlib Python service (`host/bin/devbox-relay`, `devbox-relay.service`),
    with the devbox CLI's own sign-in (which refreshes itself), and is visible in `claude agents`,
    claude.ai/code and the phone app. Its prompt tells it to finish the task and to stop before any
    decision that belongs to the user (sending, publishing, paying, deleting).
+   The fork is also **pinned** (its short id is added to `~/.claude/jobs/pins.json`): the Claude
+   background daemon retires an unpinned idle session after about 8 h (`bg retire ...: idle-prompt`
+   in `~/.claude/daemon.log`) and then exits, which shows as "Remote Control disconnected" on
+   claude.ai/code. Pinned sessions are exempt; the threshold itself cannot be configured.
 4. Only once the fork exists, the original is stopped (SIGTERM) for the auth and waiting cases.
 5. Each relay is written to `~/dev/_relay/log.md`; state is in `~/.local/state/devbox-relay`. A
    session is relayed again only if its conversation moved on; failures are retried up to 3 times.

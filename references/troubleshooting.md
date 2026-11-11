@@ -50,4 +50,5 @@ Problems met while building the reference setup, with their fix.
 | Usage is billed to the API | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is set on the devbox. Remove it; check with `/status` in a session. |
 | A relayed original session starts redoing the work | The guard hook is missing: `jq .hooks.SessionStart ~/.claude/settings.json` must contain `devbox-relay guard`. Re-run `20-user-setup.sh`. |
 | The relay did nothing | `devbox-relay status` shows what it sees. A session that finished its turn, was interrupted, or was idle long before the app left is not relayed, by design. |
+| A relay session shows "Remote Control disconnected" and `claude agents --json` lists it without a `pid` | The daemon retired it after ~8 h idle (`grep retire ~/.claude/daemon.log`). Bring it back with `claude respawn <id>`; pin it by adding its short id to the JSON list in `~/.claude/jobs/pins.json`. Relays made by `devbox-relay` are pinned automatically. |
 | `devbox-relay test` fails | Claude Code's output format may have changed: read the failing case and the transcript format in `~/.claude/projects/*/*.jsonl`. |
