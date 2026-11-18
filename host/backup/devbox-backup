@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# devbox-backup: encrypted, incremental backup of the devbox with restic.
+#
+#   devbox-backup run        back up, apply retention; on Sundays also prune and check the repository
+#   devbox-backup status     last success, last snapshots, next runs
+#   devbox-backup watchdog   alert if the last successful backup is too old
+#   devbox-backup restic …   run restic with this configuration (snapshots, ls, restore, mount…)
+#
+# Installed by host/50-backup.sh. Configuration in /etc/devbox-backup (root only): backup.env,
+# excludes (managed by the skill), excludes.local (yours), restic-password, and rclone.conf or
+# credentials.env depending on the repository. Run nightly by devbox-backup.timer; a failure starts
+# devbox-backup-alert.service.
+set -Eeuo pipefail
+umask 077
+
+CONF_DIR=/etc/devbox-backup
+STATE_DIR=/var/lib/devbox-backup
+STAGE_DIR=/var/backups/devbox-staging
+# Optional plain-text copy of the runbook and scripts (no secrets), sent next to the repository so it
+# can be read when the devbox is gone (rclone repositories only, see TOOL_REMOTE).
+TOOL_DIR=/usr/local/share/devbox-backup
+LOG_HINT="sudo journalctl -u devbox-backup -n 50 --no-pager"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+
+[[ $EUID -eq 0 ]] || { echo "devbox-backup: run as root (sudo)" >&2; exit 2; }
+# A broken backup.env must not silence the alerts: read what can be read, and let "run" fail
+# (which starts the alert unit) instead of dying here.
+CONFIG_OK=1
+set +u
+# shellcheck source=/dev/null
+source "$CONF_DIR/backup.env" || CONFIG_OK=0
+set -u
+: "${BACKUP_USER:=}" "${RESTIC_REPOSITORY:=}" "${BACKUP_PATHS:=}"
+: "${KEEP_DAILY:=14}" "${KEEP_WEEKLY:=8}" "${KEEP_MONTHLY:=12}" "${MAX_AGE_HOURS:=30}"
+: "${NOTIFY_URL:=}" "${NOTIFY_CMD:=}" "${TOOL_REMOTE:=}"
+USER_HOME='' USER_UID='' USER_GID=''
+if [[ -n $BACKUP_USER ]] && id "$BACKUP_USER" >/dev/null 2>&1; then
+  USER_HOME=$(getent passwd "$BACKUP_USER" | cut -d: -f6)
+  USER_UID=$(id -u "$BACKUP_USER")
+  USER_GID=$(id -g "$BACKUP_USER")
+else
+  CONFIG_OK=0
+fi
+[[ -n $RESTIC_REPOSITORY ]] || CONFIG_OK=0
+[[ -n $BACKUP_PATHS ]] || BACKUP_PATHS="$USER_HOME /etc /root /usr/local /usr/share/keyrings /var/lib/tailscale /var/lib/samba /var/spool/cron /var/backups"
+
+export RESTIC_REPOSITORY
+export RESTIC_PASSWORD_FILE=$CONF_DIR/restic-password
+export RCLONE_CONFIG=$CONF_DIR/rclone.conf
+export RESTIC_CACHE_DIR=/var/cache/restic
+export RESTIC_COMPRESSION=auto
+export GOMAXPROCS=${GOMAXPROCS:-2}
+
+# Backend keys (S3, B2, Azure...) only in the environment of restic itself, never in the commands
+# run as the dev user (see references/backup.md).
+with_creds() {
+  (
+    if [[ -f $CONF_DIR/credentials.env ]]; then
+      set -a
+      # shellcheck source=/dev/null
+      source "$CONF_DIR/credentials.env"
+      set +a
+    fi
+    exec "$@"
+  )
+}
+
+# Commands run as the dev user, with a clean environment (no root variables, no backend keys).
+# setpriv rather than runuser: no PAM session, so no journal line per command. An array (not a
+# function) so that it can follow timeout.
+AS_USER=(setpriv --reuid="$USER_UID" --regid="$USER_GID" --init-groups
+         env -i PATH="$USER_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" HOME="$USER_HOME"
+         USER="$BACKUP_USER" LOGNAME="$BACKUP_USER" XDG_RUNTIME_DIR="/run/user/$USER_UID" LANG=C.UTF-8)
+
+notify_once() {
+  local msg=$1 ok=1
+  if [[ -n $NOTIFY_URL ]]; then
+    # The URL (an ntfy topic is a secret) goes through stdin, not the command line.
+    printf 'url = "%s"\n' "$NOTIFY_URL" | curl -fsS --max-time 15 -K - -H "Title: devbox backup" \
+      -H "Priority: 4" -H "Tags: warning" --data-raw "$msg" >/dev/null || ok=0
+  fi
+  if [[ -n $NOTIFY_CMD && -n $USER_UID ]]; then
+    # A shell command run as the dev user; the message is appended as its last argument.
+    timeout 60 "${AS_USER[@]}" sh -c "$NOTIFY_CMD \"\$1\"" devbox-backup "$msg" </dev/null || ok=0
+  fi
+  [[ $ok -eq 1 ]]
+}
+
+alert() {  # three tries: the network may be what failed
+  local i
+  log "ALERT: $1"
+  [[ -n $NOTIFY_URL || -n $NOTIFY_CMD ]] || return 0
+  for i in 1 2 3; do
+    notify_once "$1" && return 0
+    [[ $i -lt 3 ]] && sleep "${ALERT_RETRY_DELAY:-30}"
+  done
+  log "notification failed three times"
+}
+
+# What a rebuild needs: packages, services, crontabs, state of the git repositories.
+write_manifest() {
+  local m=$STAGE_DIR/manifest
+  rm -rf "$m"; mkdir -p "$m"
+  mf() {  # mf <file> <command…>: a failing command is logged, the rest goes on
+    local f=$1; shift
+    timeout 120 "$@" > "$m/$f" 2>&1 || log "manifest: '$*' failed (code $?)"
+  }
+  mf dpkg-selections.txt dpkg --get-selections
+  mf apt-manual.txt apt-mark showmanual
+  mf apt-sources.txt ls -l /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings
+  mf systemd-system-enabled.txt systemctl list-unit-files --state=enabled --no-pager
+  mf systemd-user-enabled.txt "${AS_USER[@]}" systemctl --user list-unit-files --state=enabled --no-pager
+  mf systemd-user-timers.txt "${AS_USER[@]}" systemctl --user list-timers --all --no-pager
+  mf "crontab-$BACKUP_USER.txt" crontab -l -u "$BACKUP_USER"
+  mf ufw.txt ufw status verbose
+  mf linger.txt loginctl show-user "$BACKUP_USER" -p Linger
+  mf user-ids.txt id "$BACKUP_USER"
+  mf npm-global.txt "${AS_USER[@]}" npm ls -g --depth=0
+  mf uname.txt uname -a
+  mf os-release.txt cat /etc/os-release
+  mf versions.txt sh -c 'restic version; rclone version 2>/dev/null | head -1'
+  mf df.txt df -h -x tmpfs -x devtmpfs
+  # Every git repository in ~/dev: branch, remote, unpushed commits, modified files.
+  local d out=$m/git-repos.tsv
+  g() { timeout 60 "${AS_USER[@]}" git --no-optional-locks -C "$d" "$@" 2>/dev/null; }
+  printf 'repo\tbranch\tremote\tunpushed\tmodified\n' > "$out"
+  for d in "$USER_HOME"/dev/*/; do
+    [[ -e $d/.git ]] || continue
+    g rev-parse --git-dir >/dev/null || continue
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(basename "$d")" "$(g branch --show-current || true)" \
+      "$(g remote get-url origin || echo NONE)" \
+      "$(g log --branches --not --remotes --oneline | wc -l)" \
+      "$(g status --porcelain | wc -l)" >> "$out"
+  done
+}
+
+# Consistent copies of the logged-in Chrome's SQLite databases (Chrome runs all the time). After a
+# restore, if Chrome finds a damaged database, copy these over it. Chrome keeps some databases under
+# an exclusive lock (Login Data, Web Data, History): those are skipped after a few seconds and only
+# the raw copy made by restic covers them.
+snapshot_chrome() {
+  local profile=$USER_HOME/.config/devbox-chrome/Default dst=$STAGE_DIR/chrome-sqlite name skipped=()
+  rm -rf "$dst"
+  [[ -d $profile ]] || return 0
+  command -v sqlite3 >/dev/null || { log "sqlite3 missing: no consistent Chrome copies"; return 0; }
+  mkdir -p "$dst"
+  for name in "Cookies" "Login Data" "Login Data For Account" "Web Data" "Account Web Data" "History"; do
+    [[ -f $profile/$name ]] || continue
+    if ! timeout 30 sqlite3 -readonly "file:$profile/$name?mode=ro" ".timeout 5000" \
+         ".backup '$dst/$name'" >/dev/null 2>&1; then
+      rm -f "$dst/$name"; skipped+=("$name")
+    fi
+  done
+  [[ ${#skipped[@]} -eq 0 ]] || log "Chrome SQLite copies: locked, skipped: ${skipped[*]}"
+}
+
+restic_cmd() { with_creds nice -n 19 ionice -c3 restic "$@"; }
+
+run() {
+  [[ $CONFIG_OK -eq 1 ]] || { log "$CONF_DIR/backup.env is unreadable or incomplete (BACKUP_USER, RESTIC_REPOSITORY)"; return 1; }
+  # One run at a time, including a "sudo devbox-backup run" typed by hand.
+  exec 9>/run/lock/devbox-backup.lock
+  flock -n 9 || { log "a backup is already running: nothing to do"; return 0; }
+  mkdir -p "$STATE_DIR" "$STAGE_DIR" "$RESTIC_CACHE_DIR"
+  chmod 700 "$STAGE_DIR"
+  log "manifest and SQLite copies"
+  write_manifest
+  snapshot_chrome
+
+  local p paths=() excl=(--exclude-file "$CONF_DIR/excludes")
+  for p in $BACKUP_PATHS; do [[ -e $p ]] && paths+=("$p"); done
+  [[ ${#paths[@]} -gt 0 ]] || { log "none of the paths exists: $BACKUP_PATHS"; return 1; }
+  [[ -f $CONF_DIR/excludes.local ]] && excl+=(--exclude-file "$CONF_DIR/excludes.local")
+  log "backing up: ${paths[*]}"
+  local rc=0
+  restic_cmd backup "${paths[@]}" \
+    --one-file-system "${excl[@]}" \
+    --exclude-caches \
+    --exclude-if-present pyvenv.cfg \
+    --exclude-if-present .nobackup \
+    --host devbox --tag nightly --retry-lock 30m \
+    --json --quiet > "$STATE_DIR/last-run.json" 2> "$STATE_DIR/last-run.err" || rc=$?
+  # restic 0.16: 0 = OK, 3 = snapshot created but some files could not be read (often a temporary
+  # file that vanished while being read), anything else = failure.
+  case $rc in
+    0) ;;
+    3) log "snapshot created, but some files could not be read:"
+       tail -20 "$STATE_DIR/last-run.err" ;;
+    *) log "restic backup failed (code $rc):"; tail -20 "$STATE_DIR/last-run.err"
+       return "$rc" ;;
+  esac
+  grep '"message_type":"summary"' "$STATE_DIR/last-run.json" > "$STATE_DIR/last-summary.json" || true
+  date -Is > "$STATE_DIR/last-success"
+  log "backup done: $(summary_line)"
+
+  log "retention: $KEEP_DAILY days, $KEEP_WEEKLY weeks, $KEEP_MONTHLY months"
+  local prune=()
+  if [[ $(date +%u) == 7 || ${FORCE_PRUNE:-0} == 1 ]]; then prune=(--prune); fi
+  restic_cmd forget --group-by host --keep-daily "$KEEP_DAILY" --keep-weekly "$KEEP_WEEKLY" \
+    --keep-monthly "$KEEP_MONTHLY" --retry-lock 30m "${prune[@]}" --quiet
+  if [[ ${#prune[@]} -gt 0 ]]; then
+    log "checking the repository (structure, plus 2% of the data read back)"
+    restic_cmd check --read-data-subset=2% --retry-lock 30m
+    date -Is > "$STATE_DIR/last-check"
+  fi
+
+  if [[ -n $TOOL_REMOTE && -d $TOOL_DIR ]]; then
+    timeout 300 rclone copy "$TOOL_DIR" "$TOOL_REMOTE" ||
+      log "copy of the runbook to $TOOL_REMOTE failed (not blocking)"
+  fi
+  log "done"
+}
+
+summary_line() {
+  python3 -I - "$STATE_DIR/last-summary.json" <<'PY' 2>/dev/null || echo "no summary"
+import json, sys
+s = json.loads(open(sys.argv[1]).read().splitlines()[-1])
+mb = lambda b: f"{b / 1e6:,.0f} MB"
+print(f"{s['files_new']} new files, {s['files_changed']} changed, "
+      f"{mb(s['data_added'])} added to the repository, {mb(s['total_bytes_processed'])} read, "
+      f"{s['total_duration']:.0f} s, snapshot {s['snapshot_id'][:8]}")
+PY
+}
+
+status() {
+  echo "Repository: $RESTIC_REPOSITORY"
+  echo "Last success: $(cat "$STATE_DIR/last-success" 2>/dev/null || echo never)"
+  echo "Last check: $(cat "$STATE_DIR/last-check" 2>/dev/null || echo never)"
+  if [[ -f $STATE_DIR/last-summary.json ]]; then echo "Last summary: $(summary_line)"; fi
+  if [[ -f $STATE_DIR/password-unsaved ]]; then
+    echo "Reminder: save $CONF_DIR/restic-password outside the devbox, then: sudo rm $STATE_DIR/password-unsaved"
+  fi
+  echo
+  with_creds restic snapshots --compact --latest 5
+  systemctl list-timers 'devbox-backup*' --no-pager
+}
+
+watchdog() {
+  local last ref ts age
+  [[ $CONFIG_OK -eq 1 ]] || { alert "$CONF_DIR/backup.env is unreadable or incomplete: no backup can run."; return 0; }
+  last=$(cat "$STATE_DIR/last-success" 2>/dev/null || true)
+  # Before the first success, count from the installation, so a fresh install does not alert.
+  ref=${last:-$(cat "$STATE_DIR/installed" 2>/dev/null || true)}
+  [[ -n $ref ]] || ref=$(date -Is)
+  ts=$(date -d "$ref" +%s 2>/dev/null) || { alert "Unreadable date in $STATE_DIR: '$ref'. See: sudo devbox-backup status"; return 0; }
+  age=$(( ($(date +%s) - ts) / 3600 ))
+  (( age > MAX_AGE_HOURS )) || return 0
+  if [[ -n $last ]]; then
+    alert "Last successful backup ${age} h ago ($last). See: $LOG_HINT"
+  else
+    alert "No successful backup since the installation ${age} h ago. See: sudo devbox-backup status; $LOG_HINT"
+  fi
+}
+
+case ${1:-run} in
+  run)      run ;;
+  status)   status ;;
+  watchdog) watchdog ;;
+  alert)    alert "The nightly backup failed. See: $LOG_HINT. If the cloud sign-in expired, redo it (references/backup.md)." ;;
+  restic)   shift; with_creds restic "$@" ;;
+  *)        sed -n '2,8p' "$0"; exit 2 ;;
+esac

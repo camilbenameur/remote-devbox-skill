@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly backup of the devbox
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=10min
+# If the machine was off at that time, the backup runs at the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

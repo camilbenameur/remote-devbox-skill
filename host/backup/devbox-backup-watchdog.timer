@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily freshness check of the devbox backup
+
+[Timer]
+OnCalendar=*-*-* 13:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Notification when the devbox backup fails
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=5min
+ExecStart=/usr/local/sbin/devbox-backup alert

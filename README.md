@@ -50,6 +50,7 @@ flowchart LR
 | `devbox-rc` | A Remote Control server: sessions you start from claude.ai/code or the phone app run on the server from the first message. |
 | `claude-task` | Long Claude Code sessions in tmux that agents can start, read and answer. |
 | File share (optional) | The server's home folder as a network drive on your computer (`Z:` in Explorer, Finder on macOS), over Tailscale only, to open what sessions write. |
+| Nightly backup (optional) | An encrypted, incremental restic backup to storage off the provider (Google Drive, S3-compatible, B2, SFTP): home folder, signed-in Chrome profile, system config and a rebuild manifest, with 14 days / 8 weeks / 12 months of history, alerts and a full restore runbook. |
 | Config mirroring | Your global `CLAUDE.md` (with a header that explains the server to Claude), skills, memory and plugin hooks, copied over. |
 | Hardening | Key-only SSH restricted to one user, public port 22 closed once Tailscale works, ufw, fail2ban, unattended upgrades, a guard against API keys. |
 
@@ -106,6 +107,10 @@ login`, `claude` + `/login` on the server, and the one-time Remote Control activ
 - The SSH key has no passphrase because the desktop app must connect without a prompt. Keep it on
   your computer only.
 - Never put `ANTHROPIC_API_KEY` on the server, or usage moves to API billing.
+- The optional backup is encrypted before it leaves the server: the storage provider, or someone
+  who gets into your cloud account alone, cannot read it. Its password and cloud token sit on the
+  server, readable through sudo: someone who takes over the server can read and delete the
+  backups. Keep a copy of the password in your password manager to rebuild.
 
 ## Limits
 
@@ -125,9 +130,10 @@ and [references/troubleshooting.md](references/troubleshooting.md) for known pro
 | `host/20-user-setup.sh` | User tools, MCP servers, screen, relay, Remote Control |
 | `host/30-root-lockdown.sh` | Closes public SSH once Tailscale works |
 | `host/40-file-share.sh` | Optional: SMB share of the home folder, tailnet only |
+| `host/50-backup.sh`, `host/backup/` | Optional: nightly encrypted backup with restic (script, system units, exclusions, Google Drive sign-in helper) |
 | `host/bin/` | `devbox-browser`, `devbox-chrome`, `devbox-novnc`, `devbox-relay`, `claude-task`, `yt-cookies` |
 | `host/systemd/`, `host/desktop/` | User services; screen menu, task bar and browser shortcut |
-| `references/` | How it works, providers, troubleshooting, prompt for an autonomous migration session |
+| `references/` | How it works, providers, troubleshooting, backup and restore, prompt for an autonomous migration session |
 
 ## License
 

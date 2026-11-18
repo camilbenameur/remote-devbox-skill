@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# devbox-gdrive-auth: signs rclone in to Google Drive with the user's own OAuth client, for
+# devbox-backup (references/backup.md, section 2). Two steps, because the user approves in a browser
+# in between:
+#
+#   sudo bash devbox-gdrive-auth start <client_secret_….json>   prints the consent link
+#   sudo bash devbox-gdrive-auth start                           same, with the client kept by a former start
+#   sudo bash devbox-gdrive-auth finish                          writes /etc/devbox-backup/rclone.conf
+#
+# start keeps the client file root-only in /etc/devbox-backup/google-oauth-client.json and deletes the
+# downloaded copy; the consent link works for 15 minutes. finish waits up to 120 s (WAIT=<s>) for the
+# consent; run it again if it is not given yet. Tokens and the client secret are never printed, but
+# rclone gets them on its command line for a moment (visible to root and the dev user, who has sudo
+# anyway).
+set -euo pipefail
+umask 077
+
+CONF=/etc/devbox-backup
+CLIENT=$CONF/google-oauth-client.json
+OUT=$CONF/.authorize.out
+REMOTE=${REMOTE:-gdrive}
+export RCLONE_CONFIG=$CONF/rclone.conf
+
+die() { printf '[error] %s\n' "$*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "Run as root (sudo)."
+install -d -m 700 "$CONF"
+
+# Anchored: matches the rclone process only, never a shell whose command line mentions it.
+stop_authorize() { pkill -f '^rclone authorize drive ' 2>/dev/null || true; }
+
+start() {
+  local json=${1:-} blob i url
+  if ! command -v rclone >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -qq rclone >/dev/null
+  fi
+  if [ -n "$json" ] && [ "$json" != "$CLIENT" ]; then
+    [ -f "$json" ] || die "Usage: sudo bash devbox-gdrive-auth start [<client_secret_….json>] (Desktop app client)"
+    python3 -I - "$json" <<'PY' || die "Not a Desktop app client file (expected an \"installed\" client)."
+import json, sys
+d = json.load(open(sys.argv[1]))["installed"]
+assert d["client_id"].endswith(".apps.googleusercontent.com") and d["client_secret"]
+PY
+    install -m 600 "$json" "$CLIENT"
+    shred -u "$json" 2>/dev/null || rm -f "$json"
+  fi
+  [ -f "$CLIENT" ] || die "No client yet: sudo bash devbox-gdrive-auth start <client_secret_….json>"
+  blob=$(python3 -I - "$CLIENT" <<'PY'
+import base64, json, sys
+d = json.load(open(sys.argv[1]))["installed"]
+s = json.dumps({"client_id": d["client_id"], "client_secret": d["client_secret"], "scope": "drive.file"})
+print(base64.urlsafe_b64encode(s.encode()).decode().rstrip("="))
+PY
+)
+  stop_authorize
+  sleep 1
+  : > "$OUT"
+  setsid nohup timeout 900 rclone authorize drive "$blob" --auth-no-open-browser >"$OUT" 2>&1 </dev/null &
+  for i in $(seq 40); do
+    url=$(grep -oE 'http://127\.0\.0\.1:[0-9]+/auth\?state=[A-Za-z0-9_-]+' "$OUT" | head -1 || true)
+    [ -n "$url" ] && break
+    sleep 0.5
+  done
+  [ -n "$url" ] || { tail -5 "$OUT" >&2; stop_authorize; die "rclone authorize did not start."; }
+  cat <<EOF
+Consent link (valid for 15 minutes; after that, run start again):
+  $url
+Open it in the devbox's shared Chrome (chrome MCP, same host), or from the computer after
+  ssh -N -L 53682:localhost:53682 devbox
+The user picks the Google account and approves access to the files this app creates. Then:
+  sudo bash $0 finish
+EOF
+}
+
+finish() {
+  local i wait=${WAIT:-120}
+  if [ ! -f "$OUT" ] || [ ! -f "$CLIENT" ]; then die "Run start first."; fi
+  for ((i = 0; i < wait; i++)); do
+    grep -q 'End paste' "$OUT" && break
+    sleep 1
+  done
+  if ! grep -q 'End paste' "$OUT"; then
+    if grep -qiE 'error|failed' "$OUT" || ! pgrep -f '^rclone authorize drive ' >/dev/null; then
+      tail -3 "$OUT" >&2; die "rclone authorize is no longer waiting: run start again (no argument needed)."
+    fi
+    echo "No consent yet. When the user has approved it, run: sudo bash $0 finish"
+    exit 3
+  fi
+  if [ -f "$RCLONE_CONFIG" ]; then
+    cp -p "$RCLONE_CONFIG" "$RCLONE_CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
+    rclone config delete "$REMOTE" >/dev/null 2>&1 || true
+  fi
+  python3 -I - "$OUT" "$CLIENT" "$REMOTE" <<'PY'
+import base64, json, re, subprocess, sys
+out, client, remote = sys.argv[1:4]
+b = re.search(r"--->\s*\n(.*?)\n\s*<---", open(out).read(), re.S).group(1).strip()
+token = b if b.startswith("{") else json.loads(base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)))["token"]
+assert "refresh_token" in json.loads(token), "no refresh token"
+d = json.load(open(client))["installed"]
+subprocess.run(["rclone", "config", "create", remote, "drive", "scope=drive.file", "use_trash=false",
+                f"client_id={d['client_id']}", f"client_secret={d['client_secret']}", f"token={token}",
+                "--non-interactive"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+PY
+  shred -u "$OUT" 2>/dev/null || rm -f "$OUT"
+  stop_authorize
+  chmod 600 "$RCLONE_CONFIG"
+  echo "Written: $RCLONE_CONFIG (remote \"$REMOTE\", scope drive.file)."
+  rclone about "$REMOTE:" 2>&1 | head -4 || true
+}
+
+case ${1:-} in
+  start)  shift; start "$@" ;;
+  finish) finish ;;
+  *)      sed -n '2,12p' "$0"; exit 2 ;;
+esac

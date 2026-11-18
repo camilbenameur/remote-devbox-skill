@@ -1,0 +1,8 @@
+[Unit]
+Description=Check that the last devbox backup is recent
+OnFailure=devbox-backup-alert.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=5min
+ExecStart=/usr/local/sbin/devbox-backup watchdog

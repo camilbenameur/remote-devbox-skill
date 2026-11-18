@@ -52,3 +52,17 @@ Problems met while building the reference setup, with their fix.
 | The relay did nothing | `devbox-relay status` shows what it sees. A session that finished its turn, was interrupted, or was idle long before the app left is not relayed, by design. |
 | A relay session shows "Remote Control disconnected" and `claude agents --json` lists it without a `pid` | The daemon retired it after ~8 h idle (`grep retire ~/.claude/daemon.log`). Bring it back with `claude respawn <id>`; pin it by adding its short id to the JSON list in `~/.claude/jobs/pins.json`. Relays made by `devbox-relay` are pinned automatically. |
 | `devbox-relay test` fails | Claude Code's output format may have changed: read the failing case and the transcript format in `~/.claude/projects/*/*.jsonl`. |
+
+## Backup
+
+| Symptom | Cause and fix |
+|---|---|
+| The first upload to Google Drive crawls, then `Fatal: unable to save snapshot` with `rateLimitExceeded` in the journal | rclone's built-in Google client is shared by all rclone users and is often throttled. Use a dedicated OAuth client (references/backup.md, section 2). A new client does not see the files of the old one: start a fresh repository. |
+| The backup works for a week, then fails with `invalid_grant` | The Google app is still in Testing: refresh tokens die after 7 days. Google Auth Platform, Audience, Publish app (In production), then sign in again. |
+| `Publish app` is greyed out | Google wants a home page and a privacy policy link on an authorized domain (Branding). |
+| `rclone purge` on the old folder: `appNotAuthorizedToChild` | With `drive.file`, delete the files first (`rclone delete <remote>:<folder>`), then `rclone rmdirs <remote>:<folder>`. |
+| `50-backup.sh` says "Repository unreadable" on a rebuilt host | restic's message is shown above it: wrong password, or a sign-in that does not see the repository (with `drive.file`, only the same OAuth client sees it). Never answer with `INIT=1`: that would start an empty repository next to the real one. |
+| `devbox-gdrive-auth finish` exits with code 3 | The user has not approved the consent link yet: run it again. If the link expired, run `start` again. |
+| `restore` fails: "exclude and include patterns are mutually exclusive" | restic 0.16 limitation: restore with several `--include` only. |
+| The journal lists Chrome databases as skipped | Expected: Chrome keeps `Login Data`, `Web Data` and `History` under an exclusive lock; restic still copies the raw files. Only `Cookies` gets a consistent copy. |
+| `systemctl is-active devbox-backup` says `activating` | A oneshot service is "activating" for the whole run. `sudo devbox-backup status` or `journalctl -fu devbox-backup`. |

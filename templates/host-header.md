@@ -50,6 +50,13 @@ On this machine:
     --bg --remote-control "<name>" --permission-mode auto "<prompt>"`, or a new session with
     `claude --bg --remote-control "<name>" ...`. `claude-task` is still available (tmux).
     Never with an API key.
+- If `devbox-backup` is installed (nightly restic backup): `sudo devbox-backup status`. To get a
+  file or folder back: find its path with `sudo devbox-backup restic ls latest <folder>` (for an
+  older date, `restic snapshots` and a snapshot ID instead of `latest`), restore it next to the
+  live one with `sudo devbox-backup restic restore latest --target /tmp/restore --include <absolute
+  path>` (it lands in `/tmp/restore/<absolute path>`), and copy back only with the user's
+  approval. `restic dump` only into a file, never into the chat. Never print
+  `/etc/devbox-backup/restic-password`.
 - sudo works without a password: ask the user before any system change (global packages,
   services, firewall, sshd, users).
 

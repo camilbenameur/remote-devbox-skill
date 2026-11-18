@@ -1,6 +1,6 @@
 ---
 name: remote-devbox
-description: Sets up, from nothing, a remote Linux "devbox" where the Claude desktop app runs its Claude Code sessions over SSH, on the user's Claude subscription (no API credits), then mirrors the user's local Claude environment there (global CLAUDE.md, skills, memory, plugin hooks, projects). Includes a shared Chrome logged in to the user's accounts that agents drive through MCP, a virtual screen viewable in a web browser, long tasks in tmux, and automatic continuation of sessions when the user's computer is turned off. Use when the user wants Claude Code sessions to run on a VPS or another machine instead of their laptop (low RAM, many sessions, Chrome tabs, installs), asks which server to rent for it, wants sessions to keep going with the computer off, wants a browser with their accounts on a server, wants to copy their CLAUDE.md, skills or memory to a remote host, or wants to repair, update or verify an existing devbox.
+description: Sets up, from nothing, a remote Linux "devbox" where the Claude desktop app runs its Claude Code sessions over SSH, on the user's Claude subscription (no API credits), then mirrors the user's local Claude environment there (global CLAUDE.md, skills, memory, plugin hooks, projects). Includes a shared Chrome logged in to the user's accounts that agents drive through MCP, a virtual screen viewable in a web browser, long tasks in tmux, and automatic continuation of sessions when the user's computer is turned off. Use when the user wants Claude Code sessions to run on a VPS or another machine instead of their laptop (low RAM, many sessions, Chrome tabs, installs), asks which server to rent for it, wants sessions to keep going with the computer off, wants a browser with their accounts on a server, wants to copy their CLAUDE.md, skills or memory to a remote host, wants a nightly encrypted backup of the devbox or to restore it after a loss, or wants to repair, update or verify an existing devbox.
 ---
 
 # remote-devbox
@@ -23,6 +23,8 @@ order. Each phase says what you do, what only the user can do, and how to check 
 - Sessions that keep going with the computer off: `devbox-relay` resumes cut Desktop sessions in the
   background, and `devbox-rc` hosts sessions started from claude.ai/code or the phone app.
 - The same global `CLAUDE.md`, skills, memory and plugin hooks as on the computer.
+- Optional: a file share of the devbox's home, and a nightly encrypted backup to storage off the
+  provider, with a restore runbook.
 
 Read [references/how-it-works.md](references/how-it-works.md) when you need the mechanics, and
 [references/troubleshooting.md](references/troubleshooting.md) as soon as something fails.
@@ -49,7 +51,8 @@ Read [references/how-it-works.md](references/how-it-works.md) when you need the 
 3. The Claude desktop app is installed and signed in, and the user's plan includes Claude Code.
 4. `git config --global user.name` and `user.email` are set (the scripts copy them to the devbox).
 5. Ask the user which optional parts they want: gatehaul (runs heavy builds in GitHub Codespaces,
-   `-Gatehaul` / `--gatehaul`), the shared logged-in Chrome (on by default), memory copy.
+   `-Gatehaul` / `--gatehaul`), the shared logged-in Chrome (on by default), memory copy, the file
+   share (Phase 7b), the nightly backup (Phase 7c).
 
 ## Phase 1: choose and order a server
 
@@ -223,6 +226,43 @@ signing and encryption, no guest, ufw drops everything that is not on `tailscale
 Files keep their Linux owner, so sessions and the user can edit the same files. Remind the user that
 anything on this drive can be read and changed by every session on the devbox.
 
+## Phase 7c (optional): nightly backup
+
+The devbox soon holds work that exists nowhere else (unpushed commits, data of scheduled jobs, the
+signed-in Chrome profile, Claude memory). Offer an encrypted, incremental nightly backup with restic
+to storage off the provider. [references/backup.md](references/backup.md) has every command (they
+assume sudo without a password; with `SUDO_NOPASSWD=0`, use `ssh -t` and let the user type it):
+
+1. **Agree with the user.** Tell them what leaves the server (Chrome profile with cookies and saved
+   passwords, SSH keys, tokens, Tailscale identity, `/etc`; encrypted, but readable by whoever takes
+   over the devbox, which holds the password), choose the destination and account together (Google
+   Drive is the tested path; it needs a dedicated Google OAuth client and a website the user owns;
+   otherwise S3-compatible storage such as R2 or B2, or SFTP), check its price, and get their yes
+   for the system change (packages, root services).
+2. **Host folder.** On a devbox set up before this feature, send `<skill>/host` to `~/devbox-setup`
+   again, as `setup-devbox` does (references/backup.md, section 4).
+3. **Credentials.** Google Drive: the Cloud project and client in the user's account (section 2),
+   then `sudo bash ~/devbox-setup/backup/devbox-gdrive-auth start <client json>`, the user approves
+   the consent link, `... finish`. Other backends: the user types the keys into
+   `/etc/devbox-backup/credentials.env` (section 3). Never read keys, tokens or secrets into the chat.
+4. **Install and first run.** `ssh -t devbox 'sudo INIT=1 bash ~/devbox-setup/50-backup.sh <user> <repository>'`,
+   then `ssh devbox 'sudo systemctl start --no-block devbox-backup'`. Follow it with
+   `systemctl show devbox-backup -p ActiveState -p Result` until `inactive` / `success`, and
+   `sudo devbox-backup status` showing a snapshot from today.
+5. **Password.** The user saves the restic password in their password manager:
+   `ssh -t devbox sudo cat /etc/devbox-backup/restic-password`. Never copy it into the chat or into a
+   file the dev user can read.
+6. **Alert.** The user sets `NOTIFY_URL` (ntfy) or `NOTIFY_CMD` with
+   `ssh -t devbox sudoedit /etc/devbox-backup/backup.env`, then test it
+   with `sudo ALERT_RETRY_DELAY=1 devbox-backup alert`: without it, a failing backup shows only in
+   the journal. Re-run `sync-claude-config` (Phase 6) so that sessions learn the backup commands.
+
+Check: `ssh devbox 'sudo devbox-backup status'` shows a snapshot from today, and one folder restored
+into `/tmp` matches the original (`sudo devbox-backup restic restore latest --target /tmp/r
+--include /home/<user>/dev/<project>`, `sudo diff -r /tmp/r/home/<user>/dev/<project>
+/home/<user>/dev/<project>`, then `sudo rm -rf /tmp/r`). After losing the devbox: the rebuild in
+references/backup.md, section 6.
+
 ## Phase 8: final check
 
 Run and report each line:
@@ -235,7 +275,8 @@ ssh devbox 'grep -c ANTHROPIC_API_KEY ~/.bashrc ~/.profile 2>/dev/null; sudo ufw
 ```
 
 Expected: every service `active` (`devbox-rc` only after Phase 7), MCP servers `chrome` and
-`playwright` connected, no API key, ufw allowing only `tailscale0` (and 41641/udp).
+`playwright` connected, no API key, ufw allowing only `tailscale0` (and 41641/udp). With Phase 7c:
+`ssh devbox 'sudo devbox-backup status'` shows a recent snapshot and both `devbox-backup` timers.
 Then tell the user what is ready, what they still have to do, and how to reach each part.
 
 ## Daily use (tell the user)
@@ -248,5 +289,7 @@ Then tell the user what is ready, what they still have to do, and how to reach e
   `claude --resume <id> --fork-session --bg --remote-control "<name>" --permission-mode auto "<prompt>"`.
 - Relay activity: `ssh devbox devbox-relay status`, log in `~/dev/_relay/log.md`.
 - Open a file a session wrote: the mapped drive from Phase 7b (for example `Z:\dev\<project>\...`).
+- Backup (Phase 7c): `sudo devbox-backup status`; restore one folder next to the live one with
+  `sudo devbox-backup restic restore latest --target /tmp/r --include <path>`.
 - Update tools: `PW_MCP_VERSION=<v> INSTALL_GATEHAUL=1 GATEHAUL_VERSION=<tag> bash ~/devbox-setup/20-user-setup.sh`.
 - A powered-off server is usually still billed.

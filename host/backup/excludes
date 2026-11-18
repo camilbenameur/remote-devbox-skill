@@ -1,0 +1,59 @@
+# restic exclusions of devbox-backup (one rule per line, --exclude syntax), managed by the skill:
+# 50-backup.sh overwrites this file. Put your own rules in /etc/devbox-backup/excludes.local.
+# A pattern without "/" matches at any depth. Python virtual environments are excluded separately
+# (--exclude-if-present pyvenv.cfg), as are folders with a CACHEDIR.TAG (--exclude-caches) or a
+# .nobackup file.
+
+# Caches and tools that are downloaded again
+/home/*/.cache
+/home/*/.npm
+/home/*/go
+/home/*/.local/go
+/home/*/.local/share/claude
+/home/*/.claude/remote/ccd-cli
+/home/*/.claude/remote/srv
+/home/*/.claude/remote/run
+/home/*/.claude/cache
+/home/*/.claude/shell-snapshots
+/home/*/.claude/session-env
+/home/*/.deno
+/root/.cache
+
+# Dependencies and build leftovers, rebuilt by npm ci, uv sync or the tests
+node_modules
+__pycache__
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.hypothesis
+.playwright-mcp
+
+# Chrome profiles (the shared devbox-chrome and any other): caches and downloaded components only.
+# Cookies, passwords, local storage, extensions and preferences stay in the backup.
+/home/*/.config/*chrome*/**/Cache
+/home/*/.config/*chrome*/**/CacheStorage
+/home/*/.config/*chrome*/**/ScriptCache
+Code Cache
+GPUCache
+GPUPersistentCache
+DawnGraphiteCache
+DawnWebGPUCache
+GrShaderCache
+ShaderCache
+GraphiteDawnCache
+component_crx_cache
+extensions_crx_cache
+optimization_guide_model_store
+/home/*/.config/*chrome*/WasmTtsEngine
+/home/*/.config/*chrome*/Safe Browsing
+/home/*/.config/*chrome*/CertificateRevocation
+/home/*/.config/*chrome*/OnDeviceHeadSuggestModel
+/home/*/.config/*chrome*/Crashpad
+/home/*/.config/*chrome*/Crash Reports
+# Profile locks: restored, they would make Chrome believe the profile is open on another machine
+/home/*/.config/*chrome*/Singleton*
+
+# Tailscale: caches and logs next to the state (tailscaled.state itself is kept)
+/var/lib/tailscale/derpmap.cached.json
+/var/lib/tailscale/dns-cache
+/var/lib/tailscale/tailscaled.log*

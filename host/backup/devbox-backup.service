@@ -1,0 +1,22 @@
+[Unit]
+Description=Encrypted backup of the devbox (restic)
+Wants=network-online.target
+After=network-online.target
+OnFailure=devbox-backup-alert.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/devbox-backup run
+# Low priority: Claude sessions and Chrome also run at night.
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=20
+MemoryHigh=3G
+# Under memory pressure, sacrifice the backup rather than a session or Chrome.
+OOMScoreAdjust=500
+TimeoutStartSec=8h
+PrivateTmp=yes
+ProtectSystem=full
+# rclone rewrites its config when it refreshes the cloud token.
+ReadWritePaths=/etc/devbox-backup
+ProtectHome=read-only
